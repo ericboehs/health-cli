@@ -1,0 +1,19 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "pathname"
+
+ROOT = Pathname(__dir__).join("..").realpath
+$LOAD_PATH.unshift(ROOT.join("lib").to_s)
+
+require "health/config"
+require "health/encryption"
+require "health/token_store"
+require "health/oauth"
+require "health/session"
+require "health/cli"
+require "health/commands/args"
+require "health/commands/auth"
+require "health/commands/config"
+
+exit(Health::CLI.run(ARGV))

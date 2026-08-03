@@ -24,7 +24,7 @@ module Health
         end
 
         @config = Health::Config.load
-        TokenStore.migrate_legacy!(@config)
+        TokenStore.migrate_legacy!(@config, io: @err)
         session = @session_factory.call(@config, tenant)
         send(sub, session)
       rescue Session::NotAuthenticated => e
@@ -61,14 +61,28 @@ module Health
 
       def status(session)
         summary = session.summary
+        usable = usable?(summary)
+
         if @global.json
           @io.puts JSON.pretty_generate(summary)
         elsif !summary["authenticated"]
           @io.puts "Not signed in. Run `health auth login`."
         else
           print_status(summary)
+          @io.puts "Expired, and no refresh token is stored. Run `health auth login`." unless usable
         end
-        summary["authenticated"] ? 0 : 1
+
+        usable ? 0 : 1
+      end
+
+      # "Authenticated" only means a token is on disk. Expired with nothing to
+      # refresh it with means nothing can be done with that token — and this is
+      # the command a script asks before deciding whether to go ahead, so exit 0
+      # would be telling it the opposite of the truth.
+      def usable?(summary)
+        return false unless summary["authenticated"]
+
+        !summary["access_token_expired"] || summary["has_refresh_token"]
       end
 
       def refresh(session)

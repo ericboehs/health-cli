@@ -966,6 +966,19 @@ class SessionTest < Minitest::Test
     assert_match(/health auth login/, err.message)
   end
 
+  # A bad gateway is the provider having a bad minute, not a revoked grant.
+  # Saying "re-authorize" sends the operator through a browser login that fixes
+  # nothing, and spends a working refresh token to find that out.
+  def test_a_transient_token_endpoint_failure_is_not_reported_as_a_dead_grant
+    oauth = FakeOAuth.new(raise_error: Health::OAuth::Error.new("token request failed (HTTP 502)"))
+    session, = build(tokens: { "access_token" => "old", "refresh_token" => "r1",
+                               "expires_at" => (Time.now - 10).to_i }, oauth: oauth)
+
+    err = assert_raises(Health::OAuth::Error) { session.access_token! }
+    assert_match(/HTTP 502/, err.message)
+    refute_match(/no longer valid/, err.message)
+  end
+
   def test_login_persists_tokens
     oauth = FakeOAuth.new
     session, store = build(oauth: oauth)
@@ -1109,7 +1122,8 @@ class CLITest < Minitest::Test
 
     write_config("client_id" => "x", "ssh_key" => key.to_s)
     tenant = Health::Config::TENANTS["central"]
-    enc.encrypt(JSON.generate("access_token" => "a", "tenant" => tenant),
+    enc.encrypt(JSON.generate("access_token" => "a", "tenant" => tenant,
+      "refresh_token" => "r", "expires_at" => Time.now.to_i + 500),
       key, Health::Config.legacy_token_path)
 
     code, out, = capture { Health::CLI.run(["auth", "status"]) }
@@ -1166,11 +1180,27 @@ class CLITest < Minitest::Test
     assert_match(/refresh token:\s+stored/, out)
   end
 
+  # Expired but refreshable is still a working setup: the next command that
+  # needs a token will get one without a browser.
   def test_auth_status_shows_expired
     write_config("client_id" => "x")
     summary = signed_in_summary.merge("access_token_expired" => true, "access_token_expires_in" => -5)
-    _code, out = run_auth(["status"], StubSession.new(summary: summary))
+    code, out = run_auth(["status"], StubSession.new(summary: summary))
+
+    assert_equal 0, code
     assert_match(/access token:\s+expired/, out)
+  end
+
+  # Expired with nothing to refresh it with is not. This is the command a
+  # script asks before deciding whether to go ahead, so it has to say no.
+  def test_auth_status_exits_one_for_a_token_that_cannot_be_used
+    write_config("client_id" => "x")
+    summary = signed_in_summary.merge("access_token_expired" => true, "access_token_expires_in" => -5,
+      "has_refresh_token" => false)
+    code, out = run_auth(["status"], StubSession.new(summary: summary))
+
+    assert_equal 1, code
+    assert_match(/no refresh token is stored/, out)
   end
 
   def test_auth_login_reports_denial
@@ -2743,7 +2773,7 @@ class PortalRecordSessionTest < Minitest::Test
 
     def initialize(seed = nil) = @saved = seed
 
-    def load = @saved
+    def load(io: nil) = @saved
     def save(jar:, person_id:) = @saved = { person_id: person_id, jar: jar }
   end
 

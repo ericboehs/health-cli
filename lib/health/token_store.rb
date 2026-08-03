@@ -69,19 +69,31 @@ module Health
     # unreadable or tenant-less store is left where it is rather than deleted:
     # it may still hold the only long-lived refresh token, and `auth login`
     # will supersede it anyway.
-    def self.migrate_legacy!(config, encryption: Encryption.new)
+    #
+    # It is left *loudly*, though. Every failure here ends with a working grant
+    # sitting on disk under a name nothing reads any more, and the next command
+    # reporting "not signed in" — which is true of the new path and false of the
+    # record. One line naming the file is the difference between a puzzle and a
+    # `mv`.
+    def self.migrate_legacy!(config, encryption: Encryption.new, io: nil)
       legacy = Config.legacy_token_path
       return nil unless File.exist?(legacy)
 
       tokens = new(config, encryption: encryption, path: legacy).read
       tenant = tokens && tokens["tenant"]
-      return nil if tenant.to_s.empty?
+      if tenant.to_s.empty?
+        io&.puts "health: #{legacy} names no tenant, so it was left in place; " \
+                 "`health auth login` will replace it"
+        return nil
+      end
 
       store = new(config, tenant: tenant, encryption: encryption)
       store.write(tokens)
       File.unlink(legacy)
       store.path
-    rescue Error, Encryption::Error
+    rescue Error, Encryption::Error => e
+      io&.puts "health: could not move #{legacy} into the per-tenant store (#{e.message}); " \
+               "it was left in place"
       nil
     end
 

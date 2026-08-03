@@ -32,7 +32,13 @@ module Health
 
       # Returns nil rather than raising when the cache is unusable: a bad cache
       # only means signing in again, which the caller is able to do anyway.
-      def load
+      #
+      # It says why, though. "Could not decrypt" and "is stale" are the same
+      # outcome here but not the same problem — a moved SSH key or a missing
+      # `age` produces the first, and no number of sign-ins will fix it. Left
+      # unsaid, that reads as an ordinary expiry until the failure resurfaces
+      # from `save` with a message about writing rather than reading.
+      def load(io: nil)
         return nil unless exist?
 
         raw = @encryption.decrypt(@path, @config.ssh_key)
@@ -41,7 +47,11 @@ module Health
         return nil if person_id.to_s.empty?
 
         { person_id: person_id, jar: CookieJar.restore(data["cookies"]) }
-      rescue JSON::ParserError, Encryption::Error
+      rescue JSON::ParserError
+        io&.puts "  cached session is unreadable; signing in again"
+        nil
+      rescue Encryption::Error => e
+        io&.puts "  cached session could not be decrypted (#{e.message}); signing in again"
         nil
       end
 

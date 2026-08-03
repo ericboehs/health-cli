@@ -40,7 +40,7 @@ module Health
         entry: Login::ENTRY, record_host: Login::RECORD_HOST)
         store ||= SessionStore.new(config)
 
-        if (saved = store.load)
+        if (saved = store.load(io: io))
           cached = new(client: Client.new(jar: saved[:jar]), person_id: saved[:person_id], host: record_host)
           return cached if cached.signed_in?
 

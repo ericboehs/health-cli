@@ -54,6 +54,14 @@ module Health
       # Cerner deliberately does not distinguish "revoked" from "suspended", and
       # a suspension can be triggered by things outside our control. Re-auth is
       # the only remedy either way, so say that instead of surfacing a raw error.
+      #
+      # But only for the errors that actually mean the grant is gone. A 502 from
+      # the token endpoint, or a connection that never opened, is the provider
+      # having a bad minute — telling the operator to re-authorize sends them
+      # through a browser login that fixes nothing and, on a bad day, spends a
+      # working refresh token to find that out.
+      raise unless invalid_grant?(e)
+
       raise NotAuthenticated, "#{e.message}\nThe stored grant is no longer valid — " \
                               "run `health auth login` to re-authorize."
     end
@@ -72,6 +80,13 @@ module Health
     def summary = TokenStore.summary(tokens)
 
     private
+
+    # The OAuth error codes that mean "this grant will never work again"
+    # (RFC 6749 §5.2). Everything else — 5xx, a timeout, a rate limit — is
+    # transient or unrelated and keeps its own message.
+    TERMINAL = /\b(invalid_grant|invalid_client|unauthorized_client|invalid_scope)\b/
+
+    def invalid_grant?(error) = error.message.match?(TERMINAL)
 
     def persist(response, existing: nil)
       merged = @store.merge_response(response, tenant: @oauth.tenant_id, existing: existing)

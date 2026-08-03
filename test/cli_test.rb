@@ -1388,6 +1388,48 @@ class CookieJarTest < Minitest::Test
     assert_equal "abc", @jar["cloud-session"]
     assert_nil @jar["nope"]
   end
+
+  # A host may scope a cookie to itself or to a parent of itself, and to
+  # nothing else. Without the check, any hop in the sign-in chain could set —
+  # or overwrite — `cloud-session` on `.healtheintent.com`, which is the one
+  # cookie that authorizes the entire record.
+  def test_a_host_cannot_scope_a_cookie_onto_an_unrelated_domain
+    absorb("cloud-session=forged; Domain=.healtheintent.com", at: "https://evil.test/")
+    absorb("sid=forged; Domain=example.com", at: "https://notexample.com/")
+
+    assert_equal 0, @jar.size
+  end
+
+  def test_a_host_may_still_scope_a_cookie_onto_its_own_parent
+    absorb("cloud-session=ok; Domain=.healtheintent.com", at: "https://sso.healtheintent.com/")
+    assert_equal "ok", @jar["cloud-session"]
+  end
+
+  # A cache written by an older version, or hand-edited, is meant to cost
+  # nothing worse than signing in again. Half-built Cookies turned it into a
+  # NoMethodError out of `health labs` instead.
+  def test_restoring_a_partial_row_fills_the_rest_rather_than_crashing
+    jar = Health::Portal::CookieJar.restore([
+      { "name" => "sid", "value" => "1", "domain" => "Portal.Example.com" },
+      { "name" => "", "value" => "x" },
+      { "value" => "no name" },
+      "not a hash",
+      nil
+    ])
+
+    assert_equal 1, jar.size
+    # No path in the row, so it defaults to "/" rather than leaving `path` nil
+    # for `start_with?` to trip over.
+    assert_equal "sid=1", jar.header_for(URI("https://portal.example.com/anywhere"))
+  end
+
+  def test_a_round_trip_through_the_cache_preserves_matching
+    absorb("cloud-session=abc; Domain=.healtheintent.com; Path=/; Secure")
+    restored = Health::Portal::CookieJar.restore(JSON.parse(JSON.generate(@jar.dump)))
+
+    assert_equal "cloud-session=abc", restored.header_for(URI("https://uhs.healtheintent.com/x"))
+    assert_nil restored.header_for(URI("http://uhs.healtheintent.com/x"))
+  end
 end
 
 class FormTest < Minitest::Test

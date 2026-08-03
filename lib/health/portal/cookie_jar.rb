@@ -50,6 +50,17 @@ module Health
           attrs = row.transform_keys(&:to_sym).slice(*Cookie.members)
           next if attrs[:name].to_s.empty?
 
+          # Fill the rest rather than building a half-nil Cookie. `store` calls
+          # `value.empty?` and `matching` calls `path.start_with?`, so one
+          # missing member turned a stale cache into a NoMethodError out of
+          # `health labs` — when a bad cache is supposed to mean nothing worse
+          # than signing in again.
+          attrs[:value] = attrs[:value].to_s
+          attrs[:domain] = attrs[:domain].to_s.downcase
+          attrs[:path] = attrs[:path].to_s.empty? ? "/" : attrs[:path].to_s
+          attrs[:secure] = !attrs[:secure].nil? && attrs[:secure] != false
+          attrs[:host_only] = !attrs[:host_only].nil? && attrs[:host_only] != false
+
           jar.add(Cookie.new(**attrs))
         end
       end
@@ -81,6 +92,13 @@ module Health
 
         domain = attrs["domain"].to_s.sub(/\A\./, "").downcase
         host_only = domain.empty?
+        host = uri.host.to_s.downcase
+
+        # A host may only scope a cookie to itself or to a parent of itself.
+        # Without this, any hop in the sign-in chain could set — or silently
+        # overwrite — `cloud-session` on `.healtheintent.com`, which is the one
+        # cookie that authorizes the entire record.
+        return nil unless host_only || host == domain || host.end_with?(".#{domain}")
 
         Cookie.new(
           name: name, value: value,

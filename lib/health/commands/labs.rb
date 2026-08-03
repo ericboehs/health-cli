@@ -86,8 +86,9 @@ module Health
       #
       # Containment rather than equality, because the page's heading and the
       # payload's name are two labels for one thing and needn't be spelled alike
-      # ("Hgb" against "Hgb A1c" is caught either way; the risk this guards is a
-      # wholesale mispairing, not a punctuation difference).
+      # ("Hgb" against "Hgb A1c" is accepted whichever side is the longer; the
+      # risk this guards is a wholesale mispairing, not a difference in how the
+      # two places spell one analyte).
       def cross_check!(results, entry)
         wanted = entry.analyte.to_s.downcase
         names = results.filter_map { |r| presence(r.analyte) }.uniq

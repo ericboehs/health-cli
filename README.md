@@ -1,11 +1,40 @@
 # health-cli
 
-A headless CLI for my own medical records, over SMART on FHIR against Oracle
-Health (Cerner). Pure Ruby stdlib — no gems at runtime.
+A headless CLI for my own medical records, against Oracle Health (Cerner) — SMART
+on FHIR where that works, the patient portal where it doesn't. Pure Ruby stdlib
+— no gems at runtime.
 
-**Status: auth spike.** Only `auth` and `config` exist. The point of this stage
-is to prove a real token against the real tenant before any resource commands
-get written.
+**Status: labs work.** `health labs` returns real values with real reference
+ranges. It does not use FHIR to do it — see *Two backends*, below.
+
+```
+$ health labs --no-vitals
+CBC
+  Hematocrit     40.2  %      42.0-53.0  Low   2026-01-15
+  Hemoglobin     14.1  g/dL   13.0-17.0        2026-01-15
+  Platelets       231  K/uL   150-400          2026-01-15
+
+Lipid Panel
+  HDL              52  mg/dL  40-60            2026-01-15
+  Triglycerides   168  mg/dL  10-150     High  2026-01-15
+
+5 results, 2 outside the stated reference range (recomputed).
+```
+
+The flags are computed here, not reported — the portal labels every result in
+the record "Normal", including the two above. And because the results endpoint
+only ever returns the latest value per analyte, `--history` goes and gets the
+rest:
+
+```
+$ health labs --history Hematocrit
+CBC — Hematocrit
+  2026-01-15  40.2  %     42.0-53.0  Low
+  2025-11-14  43.6  %     42.0-53.0
+  2025-04-02  41.8  %     42.0-53.0  Low
+```
+
+(Values throughout this README are illustrative, not mine.)
 
 ## Install
 
@@ -28,10 +57,17 @@ time.
 ## Usage
 
 ```sh
+health labs                        # latest value per analyte, with ranges
+health labs --abnormal             # only what's outside its reference range
+health labs --no-vitals            # labs only; --vitals for the other half
+health labs --panel cbc            # one panel
+health labs --since 2026-01-15 --until 2026-01-15   # one draw
+health labs --history Hct          # every recorded draw of one analyte
+
 health auth login          # browser sign-in, standalone patient launch
 health auth status         # is there a usable token? (never prints one)
 health auth refresh        # force a refresh
-health auth logout         # delete the encrypted token store
+health auth logout         # delete the encrypted token store and portal session
 
 health config show         # prints the file as written — op:// stays a reference
 health config edit
@@ -40,7 +76,47 @@ health config edit
 `--json` on any command swaps formatted output for JSON. `--tenant <name>`
 overrides the tenant for a single `auth` invocation.
 
-## How the login works
+Counts and sign-in chatter go to stderr, so `health labs --json | jq` gets
+nothing but JSON.
+
+## Two backends
+
+`auth` talks to Millennium over FHIR. `labs` does not, because **the FHIR
+endpoint has no lab values in it**: `Observation?category=laboratory` returns a
+full page of resources with zero `valueQuantity` and zero `referenceRange` —
+codes and dates and nothing else. Broadening the app registration to all 37 patient scopes
+changed the response by zero bytes, so this is a data problem, not an
+authorization one.
+
+The values live in HealtheIntent, the platform behind the patient portal, and
+the portal serves them as JSON to anyone who asks for `Accept:
+application/json` on the same URL the browser navigates to. So `labs` signs into
+the portal and reads that. The two backends see different records — Millennium
+is the deeper archive, carrying several times the conditions and documents;
+HealtheIntent is the curated current view, and the only source of structured lab
+values.
+
+## How the portal login works
+
+No browser, no Playwright — a short chain of `Net::HTTP` requests:
+
+1. `GET` the portal entry page, which bounces to a Cerner Health SAML endpoint.
+2. That endpoint renders an ordinary Django login form; post it with credentials
+   read from 1Password at that moment and never written down.
+3. The response is a SAML POST-binding page whose auto-submitting form hands the
+   assertion back to the portal.
+4. The portal sets `cloud-session` on `.healtheintent.com`, and that one cookie
+   authorizes the whole record.
+
+`Login` walks whatever form it is shown rather than hard-coding the six hops, so
+the provider inserting or reordering a step doesn't break it.
+
+The session is then cached — age-encrypted, same as the tokens — so the next
+command needs neither 1Password nor the SAML chain. A cold run takes ~7s and one
+biometric prompt; a warm one takes ~1s and none. Liveness is decided by trying
+it, since the portal publishes no expiry.
+
+## How the FHIR login works
 
 Standalone patient launch, authorization-code grant, public client:
 
@@ -58,6 +134,50 @@ favicon request doesn't abort a login in progress. It refuses a redirect whose
 `state` doesn't match, rather than exchanging a code it didn't ask for.
 
 ## Things that are non-obvious
+
+**The portal's `normalcy` field is a constant.** Every result in the record,
+without exception, is labelled `"Normal"` — including a vitamin D below the
+floor of its own stated range, a hematocrit below its, and a triglyceride above
+its. A tenth of the results are outside their own printed range and the field
+calls each one normal. So normalcy is always
+recomputed from the `referenceRanges` the same payload supplies; the portal's
+claim is parsed and carried along as `reported_normalcy`, unused, for
+comparison. Trusting it would have meant `--abnormal` printing nothing, ever.
+
+**`results` returns the latest value per analyte, not every draw.** A window
+spanning 2010–2026 still yields exactly one hematocrit. A result type with
+`hasMore: true` — which is nearly all of them — has its earlier values behind a
+second endpoint. The parser surfaces that as `truncated`, `labs` discloses the
+count on stderr, and `--history` is what goes and gets them.
+
+**The history endpoint is keyed by an id that exists only in the HTML.**
+`results/history/` serves clean JSON like everything else, but only when asked
+for a `name_and_type_uuid` — a value that appears on no panel, no result type
+and no result in any JSON payload. It is emitted solely into the rendered
+page, on the "View all for this result" link. Asking instead for `type=Hct`,
+which is what the per-result `detailUrl` uses, answers *"we're unable to find
+the results you searched for"* and hands back the default listing — a wrong
+answer with a 200 on it. So `--history` scrapes the ids out of the page first.
+That is the one place this tool reads HTML, and there is no other way in.
+
+**`page_size` fails open.** It is honoured at 100 and ignored at 500, where the
+server quietly reverts to 25 rather than erroring. A request that returns a
+prefix of the answer and calls it success is the worst outcome available here,
+so `history` asks for a size known to work and follows the cursor — which is
+itself only reachable through the `page_key` embedded in each row's detail
+link, since the response carries no paging fields of its own.
+
+**Grant storage is per tenant.** Every login rewrites the whole store, so a
+single shared file meant `--tenant west` silently destroying the grant for
+`central` — no error, just a browser round-trip the next time. Each tenant now
+gets its own file, and `auth` moves a pre-split `tokens.age` into place on the
+way through, reading the tenant out of the file rather than guessing.
+
+**Nothing in the payload separates labs from vitals.** Blood pressure, BMI and
+weight arrive in the same shape as a CBC; `item.type` merely repeats the panel
+name, and `category`/`classification` don't exist. `--vitals` / `--no-vitals`
+therefore match panel names against a regex list, which is a naming convention
+and not a contract. `--panel` is the escape hatch when it guesses wrong.
 
 **PKCE.** None of the three UHS tenants advertise
 `code_challenge_methods_supported` in their SMART configuration — the sandbox
@@ -96,16 +216,25 @@ none and let the server object if it disagrees.
 | Path | What |
 | --- | --- |
 | `~/.config/health/config.json` | client id, tenant, redirect URI, scopes |
-| `~/.local/share/health/tokens.age` | tokens, age-encrypted to an SSH key, mode 0600 |
+| `~/.local/share/health/tokens/<tenant>.age` | FHIR tokens, one file per tenant, age-encrypted to an SSH key, mode 0600 |
+| `~/.local/share/health/portal-session.age` | portal cookies + person id, same encryption |
 | `~/.local/share/health/cache/` | SMART discovery documents |
 
-Tokens are encrypted to an SSH *key* rather than a passphrase, which is what
-keeps the tool non-interactive: a read needs the private key on disk, not a
-prompt.
+`auth logout` clears every tenant's grant and the portal session, not just the
+current tenant's — anything less would not be signing out.
+
+These are encrypted to an SSH *key* rather than a passphrase, which is
+what keeps the tool non-interactive: a read needs the private key on disk, not a
+prompt. `portal-session.age` gets the same treatment as the tokens because it
+deserves it — `cloud-session` is a live credential to the entire record, not a
+scoped token. Caching the password instead would have traded one prompt for a
+worse secret at rest and still paid the SAML round-trip every run.
 
 Nothing here ever writes a token to a log, an error message, or stdout.
 `auth status` reports presence booleans, a scope count, and an expiry — never a
-value, not even a prefix.
+value, not even a prefix. Portal errors name the section and the HTTP status and
+deliberately omit the response body, which would be PHI on its way to a crash
+report.
 
 ## Tests
 
@@ -115,6 +244,13 @@ ruby test/cli_test.rb
 
 No network. The OAuth token and discovery paths run against a real loopback HTTP
 server rather than a mock, and `auth login` is covered end to end by overriding
-the one method that would open a browser. 100% line coverage is enforced; the
-two genuinely untestable branches (launching Safari, a browser resetting the
-connection mid-write) are marked `:nocov:`.
+the one method that would open a browser. The portal login is tested the same
+way: a loopback server serves the SAML and Django pages, so the redirect chain,
+the cookie-domain rules and the session cache are all exercised for real.
+
+100% line coverage is enforced; the two genuinely untestable branches (launching
+Safari, a browser resetting the connection mid-write) are marked `:nocov:`.
+
+One trap worth knowing about: any test that builds a real record factory has to
+take `op` off `PATH` first. With a live 1Password session available it will
+happily sign in to the actual portal and pull actual results into the test run.

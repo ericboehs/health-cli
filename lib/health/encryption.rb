@@ -2,7 +2,7 @@ require "open3"
 
 module Health
   # age encryption against an SSH key, mirroring the pattern already proven in
-  # ~/Code/github.com/ericboehs/slk. Encrypting to a *key* rather than a
+  # github.com/ericboehs/slk. Encrypting to a *key* rather than a
   # passphrase is what keeps `health` non-interactive: reads need the private
   # key on disk, not a prompt.
   class Encryption

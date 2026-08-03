@@ -1521,7 +1521,7 @@ class PortalCredentialsTest < Minitest::Test
   end
 
   def both_fields
-    JSON.generate([{ "label" => "username", "value" => "ericboehs" },
+    JSON.generate([{ "label" => "username", "value" => "portal-user" },
       { "label" => "password", "value" => "hunter2" }])
   end
 
@@ -1529,7 +1529,7 @@ class PortalCredentialsTest < Minitest::Test
     with_fake_op("#{op_returning(both_fields)}\necho \"$@\" > #{@tmp}/argv") do
       creds = Credentials.load
 
-      assert_equal "ericboehs", creds.username
+      assert_equal "portal-user", creds.username
       assert_equal "hunter2", creds.password
       argv = File.read("#{@tmp}/argv")
       assert_includes argv, Credentials::DEFAULT_ITEM
@@ -1550,7 +1550,7 @@ class PortalCredentialsTest < Minitest::Test
   end
 
   def test_a_single_field_response_is_still_accepted
-    single = JSON.generate({ "label" => "username", "value" => "ericboehs" })
+    single = JSON.generate({ "label" => "username", "value" => "portal-user" })
 
     with_fake_op(op_returning(single)) do
       err = assert_raises(Credentials::Error) { Credentials.load }
@@ -1583,12 +1583,12 @@ class PortalCredentialsTest < Minitest::Test
   # The password must not be reachable through the paths that end up in logs,
   # backtraces or a crash report.
   def test_the_password_never_appears_in_inspect_or_to_s
-    creds = Credentials.new(username: "ericboehs", password: "hunter2")
+    creds = Credentials.new(username: "portal-user", password: "hunter2")
 
     refute_includes creds.inspect, "hunter2"
     refute_includes creds.to_s, "hunter2"
     refute_includes "#{creds}", "hunter2"
-    assert_includes creds.inspect, "ericboehs"
+    assert_includes creds.inspect, "portal-user"
   end
 end
 
@@ -1635,7 +1635,7 @@ class PortalLoginTest < Minitest::Test
   end
 
   def login(io: nil, **kwargs)
-    Login.new(credentials: Health::Portal::Credentials.new(username: "ericboehs", password: "hunter2"),
+    Login.new(credentials: Health::Portal::Credentials.new(username: "portal-user", password: "hunter2"),
       io: io, entry: "#{@stub.base}/pages/health_record/results", record_host: @stub.base, **kwargs)
   end
 
@@ -1654,7 +1654,7 @@ class PortalLoginTest < Minitest::Test
     login.call
     posted = URI.decode_www_form(@stub.requests[1].body).to_h
 
-    assert_equal "ericboehs", posted["login_username"]
+    assert_equal "portal-user", posted["login_username"]
     assert_equal "hunter2", posted["login_password"]
     assert_equal "csrf-abc", posted["csrfmiddlewaretoken"]
     assert_match(%r{/pages/health_record/results\z}, @stub.requests[1].headers["referer"])

@@ -12,7 +12,9 @@ module Health
     class Credentials
       class Error < Portal::Error; end
 
-      DEFAULT_ITEM = "cernerhealth.com (ericboehs)".freeze
+      # Overridable via `portal.op_item` / `portal.op_vault` in config.json,
+      # since 1Password item names are personal to whoever is running this.
+      DEFAULT_ITEM = "cernerhealth.com".freeze
       DEFAULT_VAULT = "Personal".freeze
 
       attr_reader :username, :password

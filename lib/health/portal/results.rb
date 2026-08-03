@@ -8,11 +8,12 @@ module Health
     # Two things about the payload are worth knowing before reading this:
     #
     # It carries its own `normalcy` string, and that field is worthless: over
-    # the whole record it reads "Normal" for every result in the record, including a
-    # vitamin D of 24.6 against a stated range of 30.0–100.0 and a hematocrit
-    # of 40.2 against 42.0–53.0. It is a constant, not a signal. So normalcy is
-    # always recomputed here from the reference range the payload itself
-    # supplies, and the portal's claim is carried along unused, for comparison.
+    # the whole record it reads "Normal" for every result without exception —
+    # including results the same payload prints as sitting outside their own
+    # reference range, in both directions. It is a constant, not a signal. So
+    # normalcy is always recomputed here from the reference range the payload
+    # itself supplies, and the portal's claim is carried along unused, for
+    # comparison.
     #
     # And it returns the *most recent* value per analyte within the requested
     # window, not every draw — a decade-wide window still yields one hematocrit.

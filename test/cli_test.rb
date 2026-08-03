@@ -1833,7 +1833,7 @@ class PortalRecordTest < Minitest::Test
   end
 
   def test_results_are_windowed_with_us_formatted_dates
-    rec = record("GET /person/PERSON1/health-record/results/" => [200, "{}"])
+    rec = record("GET /person/PERSON1/health-record/results/" => [200, '{"items":[]}'])
     rec.results(from: Date.new(2010, 1, 1), to: Date.new(2026, 5, 7))
 
     query = URI.decode_www_form(URI(@stub.requests.first.path).query).to_h
@@ -1914,17 +1914,27 @@ class PortalRecordTest < Minitest::Test
     assert_equal %w[cursor1 next], calls.last.values_at("page_key", "dir")
   end
 
-  # Both spellings of "there is no next page". Sending "None" back would ask
-  # for the first page again, and keep asking.
-  def test_history_stops_when_a_full_page_carries_no_cursor
-    [nil, "None"].each do |key|
-      page = history_page(Record::PAGE_SIZE, key: key)
-      rec = record("GET /person/PERSON1/health-record/results/history/" => [200, JSON.generate(page)])
+  # "None" is how the portal spells "there is no next page" — sending it back
+  # would ask for the first page again, and keep asking. It is the server
+  # answering the question, so a full page ending that way is a complete
+  # history and stops the walk without complaint.
+  def test_a_full_page_whose_cursor_says_none_ends_the_history
+    page = history_page(Record::PAGE_SIZE, key: "None")
+    rec = record("GET /person/PERSON1/health-record/results/history/" => [200, JSON.generate(page)])
 
-      assert_equal Record::PAGE_SIZE, rec.history("UUID1")["items"].size
-      assert_equal 1, @stub.requests.size
-      @stub.stop
-    end
+    assert_equal Record::PAGE_SIZE, rec.history("UUID1")["items"].size
+    assert_equal 1, @stub.requests.size
+  end
+
+  # No page_key at all is a different answer: the link shape changed, and there
+  # is no longer any way to know whether more draws exist. Returning the rows in
+  # hand would present a prefix of a history as the whole of it.
+  def test_a_full_page_with_no_readable_cursor_is_an_error
+    page = history_page(Record::PAGE_SIZE, key: nil)
+    rec = record("GET /person/PERSON1/health-record/results/history/" => [200, JSON.generate(page)])
+
+    err = assert_raises(Record::Error) { rec.history("UUID1") }
+    assert_match(/no cursor to continue from/, err.message)
   end
 
   def history_page(count, key:)
@@ -1932,11 +1942,27 @@ class PortalRecordTest < Minitest::Test
     { "items" => Array.new(count) { |i| { "id" => i.to_s, "detailUrl" => detail } } }
   end
 
-  def test_history_gives_up_rather_than_paging_forever
+  # Same reasoning as the missing cursor: the page cap exists to stop a loop,
+  # not to define how much of a history is worth showing.
+  def test_history_refuses_to_return_a_prefix_when_it_hits_the_page_cap
     page = history_page(Record::PAGE_SIZE, key: "same-cursor-every-time")
     rec = record("GET /person/PERSON1/health-record/results/history/" => [200, JSON.generate(page)])
 
-    assert_equal Record::MAX_PAGES * Record::PAGE_SIZE, rec.history("UUID1")["items"].size
+    err = assert_raises(Record::Error) { rec.history("UUID1") }
+    assert_match(/refusing to present a prefix/, err.message)
+  end
+
+  # A 200 of valid JSON in an unrecognised shape used to flatten to [] at every
+  # level and print "no results matched" with exit 0 — a broken scrape and an
+  # empty window reading identically. For a medical record they must not.
+  def test_json_in_an_unrecognised_shape_is_an_error
+    ["{}", '{"data":{"items":[]}}', "[]", "null", '"nope"'].each do |body|
+      rec = record("GET /person/PERSON1/health-record/results/" => [200, body])
+
+      err = assert_raises(Record::Error) { rec.fetch("results") }
+      assert_match(/not in a recognised shape/, err.message)
+      @stub.stop
+    end
   end
 
   def test_open_signs_in_and_positions_on_the_person

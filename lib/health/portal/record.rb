@@ -90,6 +90,7 @@ module Health
       def history(uuid)
         items = []
         page_key = nil
+        complete = false
 
         MAX_PAGES.times do
           params = { "name_and_type_uuid" => uuid, "page_size" => PAGE_SIZE }
@@ -98,10 +99,29 @@ module Health
           rows = Array(page["items"])
           items.concat(rows)
 
-          break if rows.size < PAGE_SIZE
+          if rows.size < PAGE_SIZE
+            complete = true
+            break
+          end
 
           page_key = cursor(rows)
-          break if page_key.nil?
+          if page_key == :end
+            complete = true
+            break
+          end
+
+          # A full page whose rows carry no readable cursor means there are more
+          # draws and no way to ask for them. The whole reason this method pages
+          # instead of sending one big request is that a silent prefix is the
+          # worst outcome here — so don't produce one by a different route.
+          if page_key.nil?
+            raise Error, "the portal returned a full page of history with no cursor to continue from"
+          end
+        end
+
+        unless complete
+          raise Error, "this analyte has more than #{MAX_PAGES * PAGE_SIZE} recorded draws — " \
+                       "refusing to present a prefix as the whole history"
         end
 
         { "items" => items }
@@ -116,12 +136,26 @@ module Health
           raise Error, "the portal did not return #{section} as JSON (HTTP #{res.code})"
         end
 
-        JSON.parse(res.body)
+        shaped(section, JSON.parse(res.body))
       rescue JSON::ParserError
         raise Error, "the portal returned unreadable #{section} data"
       end
 
       private
+
+      # "Treat every field as optional" has to stop at the payload's skeleton.
+      # Without this check a 200 carrying valid JSON in a shape nobody here
+      # recognises — a wrapper object, an error document, a login page rendered
+      # as JSON — collapses to `[]` at every level and prints "no results
+      # matched", exit 0. That is byte-identical to a genuinely empty window,
+      # so a scrape that has silently stopped working reads as a clean answer
+      # about a medical record. Say the format changed instead.
+      def shaped(section, payload)
+        return payload if payload.is_a?(Hash) && payload.key?("items")
+
+        raise Error, "the portal's #{section} response was not in a recognised shape — " \
+                     "the format has probably changed"
+      end
 
       # The cursor for "the page these rows came from" is not a field of the
       # response — it is only reachable through the `page_key` the server
@@ -129,8 +163,14 @@ module Health
       def cursor(rows)
         key = rows.first.to_h["detailUrl"].to_s[/page_key=([^&]+)/, 1]
         # The portal writes the literal "None" where a page has no cursor;
-        # sending that back asks for the first page again, forever.
-        (key.nil? || key == "None") ? nil : key
+        # sending that back asks for the first page again, forever. That is the
+        # server saying "this is the end", which is a different answer from
+        # finding no `page_key` at all — the latter means the link shape changed
+        # and we can no longer tell whether more draws exist. `history` has to
+        # distinguish them, so return :end rather than folding both into nil.
+        return :end if key == "None"
+
+        key
       end
 
       def fetch_html(section, params = {})

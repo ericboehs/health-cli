@@ -1439,6 +1439,22 @@ class FormTest < Minitest::Test
     page = URI("https://idp.example.com/auth/login")
     assert_equal page.to_s, Form.all("<form></form>").first.action_url(page)
   end
+
+  # `\b` matches between the hyphen and the "a" of `data-action`, so a
+  # leftmost match on `\baction=` read the wrong attribute — on the form that
+  # carries the password. An attribute boundary is whitespace, not `\b`.
+  def test_a_prefixed_attribute_is_not_mistaken_for_the_one_asked_for
+    form = Form.all('<form data-action="/analytics" action="/login" data-method="get" method="post">' \
+                    '<input name="login_password"></form>').first
+
+    assert_equal "/login", form.action
+    assert_equal "post", form.method
+  end
+
+  def test_a_suffixed_attribute_is_not_mistaken_for_the_one_asked_for
+    form = Form.all('<form actionable="/nope" action="/login"></form>').first
+    assert_equal "/login", form.action
+  end
 end
 
 class PortalClientTest < Minitest::Test

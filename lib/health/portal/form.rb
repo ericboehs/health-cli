@@ -50,16 +50,22 @@ module Health
           body.scan(FIELD).each_with_object({}) do |(attrs), acc|
             name = attr(attrs, "name")
             next if name.nil? || name.empty?
-            next if attr(attrs, "type").to_s.downcase == "submit" && !attrs.match?(/\bvalue=/i)
+            next if attr(attrs, "type").to_s.downcase == "submit" && !attrs.match?(/(?:\A|\s)value\s*=/i)
 
             acc[name] = CGI.unescapeHTML(attr(attrs, "value").to_s)
           end
         end
 
+        # The boundary is whitespace, not `\b`: `\b` matches between the hyphen
+        # and the "a" of `data-action`, so `data-action="/x" action="/login"`
+        # resolved to `/x` — and this runs on the form that carries the
+        # password. Leftmost-match means the impostor wins whenever it comes
+        # first in the tag.
         def attr(attrs, name)
-          m = attrs.match(/\b#{name}\s*=\s*"([^"]*)"/i) ||
-              attrs.match(/\b#{name}\s*=\s*'([^']*)'/i) ||
-              attrs.match(/\b#{name}\s*=\s*([^\s>]+)/i)
+          key = Regexp.escape(name)
+          m = attrs.match(/(?:\A|\s)#{key}\s*=\s*"([^"]*)"/i) ||
+              attrs.match(/(?:\A|\s)#{key}\s*=\s*'([^']*)'/i) ||
+              attrs.match(/(?:\A|\s)#{key}\s*=\s*([^\s>]+)/i)
           m && m[1]
         end
       end

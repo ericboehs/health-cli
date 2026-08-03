@@ -114,12 +114,27 @@ module Health
       def data_dir    = xdg("XDG_DATA_HOME", ".local/share").join("health")
       def cache_dir   = data_dir.join("cache")
       def state_dir   = xdg("XDG_STATE_HOME", ".local/state").join("health")
-      def token_path  = data_dir.join("tokens.age")
+      def token_dir   = data_dir.join("tokens")
+
+      # One file per tenant. A single shared file would mean `--tenant west`
+      # silently overwriting the grant for `central`, since each login writes
+      # the whole store.
+      #
+      # The id is slugged rather than interpolated: `--tenant` takes an
+      # arbitrary string so an id Oracle adds later needs no code change, and a
+      # command-line argument must not get to choose a path.
+      def token_path(tenant_id)
+        token_dir.join("#{tenant_id.to_s.gsub(/[^A-Za-z0-9._-]/, "_")}.age")
+      end
+
+      # Where the store lived before it was split per tenant.
+      # See TokenStore.migrate_legacy!.
+      def legacy_token_path = data_dir.join("tokens.age")
 
       def ensure_dirs!
-        [config_dir, data_dir, cache_dir, state_dir].each { |d| FileUtils.mkdir_p(d) }
-        # The token file and the discovery cache both sit under data_dir.
-        [data_dir, cache_dir].each { |d| File.chmod(0o700, d) }
+        [config_dir, data_dir, cache_dir, state_dir, token_dir].each { |d| FileUtils.mkdir_p(d) }
+        # Token files and the discovery cache all sit under data_dir.
+        [data_dir, cache_dir, token_dir].each { |d| File.chmod(0o700, d) }
       end
 
       def load

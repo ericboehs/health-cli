@@ -442,6 +442,82 @@ class TokenStoreTest < Minitest::Test
   end
 end
 
+# One file per tenant. Before this, `--tenant west` overwrote the grant for
+# `central`, because every login rewrites the whole store.
+class TokenStoreTenantTest < Minitest::Test
+  include XDGSandbox
+
+  Crypto = TokenStoreTest::PlainCrypto
+
+  def store(tenant) = Health::TokenStore.new(config, tenant: tenant, encryption: Crypto.new)
+
+  def test_each_tenant_gets_its_own_file
+    central, west = store("central"), store("west")
+
+    refute_equal central.path, west.path
+    assert_equal Health::Config::TENANTS["central"], File.basename(central.path, ".age")
+  end
+
+  def test_signing_into_a_second_tenant_leaves_the_first_alone
+    store("central").write("access_token" => "central-token", "tenant" => "central")
+    store("west").write("access_token" => "west-token", "tenant" => "west")
+
+    assert_equal "central-token", store("central").read["access_token"]
+    assert_equal "west-token", store("west").read["access_token"]
+  end
+
+  # `--tenant` takes an arbitrary string so a tenant Oracle adds later needs no
+  # code change; that string must not get to choose a path.
+  def test_a_tenant_id_cannot_escape_the_token_directory
+    path = store("../../etc/passwd").path
+
+    assert_equal Health::Config.token_dir.to_s, File.dirname(path)
+    assert_equal ".._.._etc_passwd.age", File.basename(path)
+  end
+
+  def test_paths_and_clear_all_span_every_tenant
+    store("central").write("access_token" => "a")
+    store("west").write("access_token" => "b")
+    Health::Config.legacy_token_path.write("old")
+
+    assert_equal 3, Health::TokenStore.paths.size
+
+    Health::TokenStore.clear_all
+
+    assert_empty Health::TokenStore.paths
+  end
+
+  def test_a_legacy_store_moves_under_the_tenant_it_names
+    legacy = Health::Config.legacy_token_path
+    legacy.write(JSON.generate("access_token" => "a", "refresh_token" => "keep",
+      "tenant" => Health::Config::TENANTS["west"]))
+
+    moved = Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new)
+
+    refute legacy.exist?
+    assert_equal store("west").path.to_s, moved.to_s
+    assert_equal "keep", store("west").read["refresh_token"]
+  end
+
+  def test_migration_is_a_no_op_without_a_legacy_store
+    assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new)
+  end
+
+  # Deleting either of these would throw away a refresh token that may still
+  # work, so they are left where they are for `auth login` to supersede.
+  def test_a_legacy_store_that_names_no_tenant_or_will_not_parse_is_left_in_place
+    legacy = Health::Config.legacy_token_path
+
+    legacy.write(JSON.generate("access_token" => "a"))
+    assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new)
+    assert legacy.exist?
+
+    legacy.write("}}} not json")
+    assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new)
+    assert legacy.exist?
+  end
+end
+
 class OAuthTest < Minitest::Test
   include XDGSandbox
 
@@ -973,6 +1049,41 @@ class CLITest < Minitest::Test
     code, out, = capture { Health::CLI.run(["auth", "logout"]) }
     assert_equal 0, code
     assert_match(/No token store/, out)
+  end
+
+  # Signing out of one tenant while another tenant's grant sits on disk would
+  # not be signing out.
+  def test_auth_logout_removes_every_tenants_grant
+    write_config("client_id" => "x")
+    Health::Config.ensure_dirs!
+    %w[central west].each { |t| Health::Config.token_path(Health::Config::TENANTS[t]).write("x") }
+
+    code, out, = capture { Health::CLI.run(["auth", "logout"]) }
+
+    assert_equal 0, code
+    assert_match(/2 token stores removed/, out)
+    assert_empty Health::TokenStore.paths
+  end
+
+  # The store used to be one file for every tenant. Anything left there is
+  # moved into place on the way through, so a login predating the split keeps
+  # working instead of silently reading as signed out.
+  def test_auth_migrates_a_pre_split_token_store
+    enc = Health::Encryption.new
+    key = Pathname(File.expand_path("~/.ssh/id_ed25519"))
+    skip "needs age and an ed25519 key" unless enc.available? && key.exist?
+
+    write_config("client_id" => "x", "ssh_key" => key.to_s)
+    tenant = Health::Config::TENANTS["central"]
+    enc.encrypt(JSON.generate("access_token" => "a", "tenant" => tenant),
+      key, Health::Config.legacy_token_path)
+
+    code, out, = capture { Health::CLI.run(["auth", "status"]) }
+
+    assert_equal 0, code
+    assert_match(/#{tenant}/, out)
+    refute Health::Config.legacy_token_path.exist?
+    assert Health::Config.token_path(tenant).exist?
   end
 
   def test_global_flags_are_stripped_before_dispatch

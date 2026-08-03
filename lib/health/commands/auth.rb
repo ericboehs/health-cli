@@ -24,6 +24,7 @@ module Health
         end
 
         @config = Health::Config.load
+        TokenStore.migrate_legacy!(@config)
         session = @session_factory.call(@config, tenant)
         send(sub, session)
       rescue Session::NotAuthenticated => e
@@ -77,16 +78,19 @@ module Health
       end
 
       def logout(session)
-        existed = session.store.exist?
+        # Every tenant, not just this one: leaving another tenant's grant on
+        # disk would not be signing out. Counted before anything is unlinked.
+        stored = TokenStore.paths.size
         session.logout!
+        TokenStore.clear_all
 
         # The cached portal session is a second live credential to the same
-        # record; "signed out" has to mean both of them are gone.
+        # record; "signed out" has to mean all of them are gone.
         portal = Portal::SessionStore.new(@config)
         portal_existed = portal.exist?
         portal.clear
 
-        @io.puts(existed ? "Signed out; token store removed." : "No token store to remove.")
+        @io.puts(stored.zero? ? "No token store to remove." : "Signed out; #{stored} token store#{"s" if stored > 1} removed.")
         @io.puts "Cached portal session removed." if portal_existed
         0
       end

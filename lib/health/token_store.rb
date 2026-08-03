@@ -14,10 +14,10 @@ module Health
 
     SECRET_KEYS = %w[access_token refresh_token id_token].freeze
 
-    def initialize(config, encryption: Encryption.new, path: nil)
+    def initialize(config, tenant: nil, encryption: Encryption.new, path: nil)
       @config = config
       @encryption = encryption
-      @path = path || Config.token_path
+      @path = path || Config.token_path(config.tenant_id(tenant))
     end
 
     attr_reader :path
@@ -44,6 +44,43 @@ module Health
     def clear
       File.unlink(@path) if exist?
       true
+    end
+
+    # Every stored grant, across every tenant.
+    def self.paths
+      Dir.glob(Config.token_dir.join("*.age").to_s).sort +
+        (File.exist?(Config.legacy_token_path) ? [Config.legacy_token_path.to_s] : [])
+    end
+
+    def self.clear_all
+      paths.each { |p| File.unlink(p) }
+      true
+    end
+
+    # Moves a pre-split store into its per-tenant home.
+    #
+    # There used to be one `tokens.age` regardless of tenant, so signing into a
+    # second tenant destroyed the first grant. The file records the tenant it
+    # belongs to, so the move needs no guessing.
+    #
+    # Returns the new path, or nil when there was nothing to move. An
+    # unreadable or tenant-less store is left where it is rather than deleted:
+    # it may still hold the only long-lived refresh token, and `auth login`
+    # will supersede it anyway.
+    def self.migrate_legacy!(config, encryption: Encryption.new)
+      legacy = Config.legacy_token_path
+      return nil unless File.exist?(legacy)
+
+      tokens = new(config, encryption: encryption, path: legacy).read
+      tenant = tokens && tokens["tenant"]
+      return nil if tenant.to_s.empty?
+
+      store = new(config, tenant: tenant, encryption: encryption)
+      store.write(tokens)
+      File.unlink(legacy)
+      store.path
+    rescue Error, Encryption::Error
+      nil
     end
 
     # Merges a token endpoint response into what's already stored.

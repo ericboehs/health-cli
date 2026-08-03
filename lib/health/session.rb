@@ -8,7 +8,7 @@ module Health
     def initialize(config, tenant: nil, store: nil, oauth: nil, io: $stderr)
       @config = config
       @tenant = tenant
-      @store = store || TokenStore.new(config)
+      @store = store || TokenStore.new(config, tenant: tenant)
       @oauth = oauth || OAuth.new(config, tenant: tenant, io: io)
       @io = io
     end

@@ -10,15 +10,16 @@ ranges. It does not use FHIR to do it — see *Two backends*, below.
 ```
 $ health labs --no-vitals
 CBC
-  Hematocrit     40.2  %      42.0-53.0  Low   2026-01-15
-  Hemoglobin     14.1  g/dL   13.0-17.0        2026-01-15
-  Platelets       231  K/uL   150-400          2026-01-15
+  Hematocrit     40.2  %      42.0 – 53.0  LOW   2026-01-15
+  Hemoglobin     14.1  g/dL   13.0 – 17.0        2026-01-15
+  Platelets       231  K/uL   150 – 400          2026-01-15
 
 Lipid Panel
-  HDL              52  mg/dL  40-60            2026-01-15
-  Triglycerides   168  mg/dL  10-150     High  2026-01-15
+  HDL              52  mg/dL  40 – 60            2026-01-15
+  Triglycerides   168  mg/dL  10 – 150     HIGH  2026-01-15
 
 5 results, 2 outside the stated reference range (recomputed).
+1 of them has earlier values on record; see `health labs --history <analyte>`.
 ```
 
 The flags are computed here, not reported — the portal labels every result in
@@ -29,9 +30,11 @@ rest:
 ```
 $ health labs --history Hematocrit
 CBC — Hematocrit
-  2026-01-15  40.2  %     42.0-53.0  Low
-  2025-11-14  43.6  %     42.0-53.0
-  2025-04-02  41.8  %     42.0-53.0  Low
+  2026-01-15  40.2  %  42.0 – 53.0  LOW
+  2025-11-14  43.6  %  42.0 – 53.0
+  2025-04-02  41.8  %  42.0 – 53.0  LOW
+
+3 draws, 2 outside the stated reference range (recomputed).
 ```
 
 (Values throughout this README are illustrative, not mine.)
@@ -53,6 +56,19 @@ or reference it so it never lands on disk:
 
 Any config value starting with `op://` is resolved through the `op` CLI at use
 time.
+
+`health labs` needs portal credentials too, and those are read straight from
+1Password rather than the config — there is no token to cache, so a username and
+password are genuinely required per run. By default it reads the `username` and
+`password` fields of an item called `cernerhealth.com` in the `Personal` vault.
+Point it elsewhere with:
+
+```json
+{ "portal": { "op_item": "cernerhealth.com (me)", "op_vault": "Private" } }
+```
+
+The password is fetched at the moment it is posted and is never written to disk,
+a log line, or `inspect`.
 
 ## Usage
 
@@ -135,14 +151,15 @@ favicon request doesn't abort a login in progress. It refuses a redirect whose
 
 ## Things that are non-obvious
 
-**The portal's `normalcy` field is a constant.** Every result in the record,
-without exception, is labelled `"Normal"` — including a vitamin D below the
-floor of its own stated range, a hematocrit below its, and a triglyceride above
-its. A tenth of the results are outside their own printed range and the field
-calls each one normal. So normalcy is always
-recomputed from the `referenceRanges` the same payload supplies; the portal's
-claim is parsed and carried along as `reported_normalcy`, unused, for
-comparison. Trusting it would have meant `--abnormal` printing nothing, ever.
+**The portal's `normalcy` field never disagreed with itself.** Every result
+observed across this record is labelled `"Normal"` — including values below the
+floor of their own stated range and above the ceiling of it. A tenth of the
+results are outside their own printed range and the field calls each one normal.
+The field can evidently hold other strings, so it isn't literally a constant; it
+simply never once carried information. So normalcy is always recomputed from the
+`referenceRanges` the same payload supplies; the portal's claim is parsed and
+carried along as `reported_normalcy`, unused, for comparison. Trusting it would
+have meant `--abnormal` printing nothing, ever.
 
 **`results` returns the latest value per analyte, not every draw.** A window
 spanning 2010–2026 still yields exactly one hematocrit. A result type with

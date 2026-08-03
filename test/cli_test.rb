@@ -3,7 +3,7 @@ require "simplecov"
 SimpleCov.start do
   add_filter "/test/"
   enable_coverage :branch
-  minimum_coverage line: 100, branch: 88
+  minimum_coverage line: 100, branch: 100
 end
 
 require "minitest/autorun"
@@ -214,6 +214,20 @@ class ConfigTest < Minitest::Test
     refute_includes scopes, "launch"
   end
 
+  # The suite runs with XDG_* pointing at a sandbox, so the branch every real
+  # macOS run takes — neither variable set — is only reachable by unsetting
+  # them. The tokens have to land somewhere predictable either way.
+  def test_the_xdg_defaults_are_used_when_the_environment_names_none
+    saved = ENV.to_hash.slice("XDG_CONFIG_HOME", "XDG_DATA_HOME")
+    ENV.delete("XDG_CONFIG_HOME")
+    ENV.delete("XDG_DATA_HOME")
+
+    assert_equal Pathname(Dir.home).join(".config", "health"), Health::Config.config_dir
+    assert_equal Pathname(Dir.home).join(".local", "share", "health"), Health::Config.data_dir
+  ensure
+    ENV.update(saved)
+  end
+
   def test_load_raises_when_config_missing
     err = assert_raises(Health::Config::Error) { Health::Config.load }
     assert_match(/config not found/, err.message)
@@ -315,6 +329,37 @@ class EncryptionTest < Minitest::Test
       enc.encrypt("x", Pathname(@tmp).join("k"), Pathname(@tmp).join("o.age"))
     end
     assert_match(/age` encryption tool is not installed/, err.message)
+  ensure
+    Health::Encryption.instance_variable_set(:@age_bin, original)
+  end
+
+  # `age` present but failing is a different case from `age` absent: a revoked
+  # recipient, a truncated file, a key the identity doesn't match. Its stderr
+  # is the only thing that says which, so it has to reach the message.
+  def test_age_failing_reports_what_age_said
+    fake = Pathname(@tmp).join("age-that-fails")
+    # Installed and answering `--version`, so `require_age!` is satisfied and
+    # the real work is what fails.
+    fake.write("#!/bin/sh\ncase \"$1\" in --version) echo 'v1.2.3'; exit 0;; esac\n" \
+               "echo 'no identity matched any of the recipients' >&2\nexit 1\n")
+    fake.chmod(0o755)
+    original = Health::Encryption.instance_variable_get(:@age_bin)
+    Health::Encryption.instance_variable_set(:@age_bin, fake.to_s)
+
+    enc = Health::Encryption.new
+    key = Pathname(@tmp).join("id_ed25519")
+    key.write("private")
+    Pathname(@tmp).join("id_ed25519.pub").write("ssh-ed25519 AAAA eric@example\n")
+
+    err = assert_raises(Health::Encryption::Error) do
+      enc.encrypt("x", key, Pathname(@tmp).join("out.age"))
+    end
+    assert_match(/age encrypt failed: no identity matched/, err.message)
+
+    file = Pathname(@tmp).join("some.age")
+    file.write("x")
+    err = assert_raises(Health::Encryption::Error) { enc.decrypt(file, key) }
+    assert_match(/age decrypt failed for #{Regexp.escape(file.to_s)}: no identity matched/, err.message)
   ensure
     Health::Encryption.instance_variable_set(:@age_bin, original)
   end
@@ -706,6 +751,46 @@ class OAuthTest < Minitest::Test
     assert_nil result
     assert_match(/no authorization code/, error.message)
   end
+
+  # A browser that opens a connection and sends nothing — a speculative
+  # pre-connect, a health check, a port scanner — must not end a login the
+  # operator is midway through.
+  def test_a_connection_that_sends_nothing_does_not_end_the_wait
+    result, error = with_listener(config, expected_state: "st8") do |port|
+      TCPSocket.new("127.0.0.1", port).close
+      get(port, "/callback?code=STILLHERE&state=st8")
+    end
+    assert_nil error
+    assert_equal "STILLHERE", result
+  end
+
+  # The listener cannot wait forever: a login abandoned in the browser would
+  # otherwise leave the process holding the port with no way out but ^C.
+  def test_the_wait_gives_up_rather_than_holding_the_port_forever
+    _result, error = with_timeout(0.2) do
+      with_listener(config, expected_state: "st8") { |_port| nil }
+    end
+    assert_match(/timed out waiting for the browser redirect/, error.message)
+  end
+
+  # And it re-checks the clock at the top of each lap, so a stream of requests
+  # on other paths cannot keep the wait alive past its deadline.
+  def test_a_deadline_already_passed_is_not_waited_on
+    _result, error = with_timeout(0) do
+      with_listener(config, expected_state: "st8") { |_port| nil }
+    end
+    assert_match(/timed out waiting for the browser redirect/, error.message)
+  end
+
+  def with_timeout(seconds)
+    original = Health::OAuth::LISTEN_TIMEOUT
+    Health::OAuth.send(:remove_const, :LISTEN_TIMEOUT)
+    Health::OAuth.const_set(:LISTEN_TIMEOUT, seconds)
+    yield
+  ensure
+    Health::OAuth.send(:remove_const, :LISTEN_TIMEOUT)
+    Health::OAuth.const_set(:LISTEN_TIMEOUT, original)
+  end
 end
 
 class OAuthNetworkTest < Minitest::Test
@@ -991,6 +1076,22 @@ class SessionTest < Minitest::Test
     assert_match(/health auth login/, err.message)
   end
 
+  # `refresh!` is public and `auth refresh` calls it directly, so it cannot
+  # lean on `access_token!` having checked first.
+  def test_refresh_on_its_own_refuses_without_something_to_refresh
+    session, = build
+    oauth = FakeOAuth.new
+
+    err = assert_raises(Health::Session::NotAuthenticated) { session.refresh! }
+    assert_match(/not signed in/, err.message)
+
+    stored, = build(tokens: { "access_token" => "old" }, oauth: oauth)
+    err = assert_raises(Health::Session::NotAuthenticated) { stored.refresh! }
+    assert_match(/no refresh token stored/, err.message)
+    # Nothing was sent to the provider on either path.
+    assert_equal 0, oauth.refreshed
+  end
+
   def test_refresh_failure_is_translated_to_reauth_guidance
     oauth = FakeOAuth.new(raise_error: Health::OAuth::Error.new("invalid_grant"))
     session, = build(tokens: { "access_token" => "old", "refresh_token" => "r1",
@@ -1131,6 +1232,18 @@ class CLITest < Minitest::Test
     code, out, = capture { Health::CLI.run(["auth", "logout"]) }
     assert_equal 0, code
     assert_match(/No token store/, out)
+  end
+
+  def test_auth_logout_of_a_single_tenant_counts_in_the_singular
+    write_config("client_id" => "x")
+    Health::Config.ensure_dirs!
+    Health::Config.token_path(Health::Config::TENANTS["central"]).write("x")
+
+    code, out, = capture { Health::CLI.run(["auth", "logout"]) }
+
+    assert_equal 0, code
+    assert_match(/1 token store removed/, out)
+    refute_match(/token stores/, out)
   end
 
   # Signing out of one tenant while another tenant's grant sits on disk would
@@ -1512,6 +1625,22 @@ class FormTest < Minitest::Test
     assert_equal "/login", form.action
     assert_equal "post", form.method
     assert_equal({ "csrfmiddlewaretoken" => "tok", "login_username" => "", "login_password" => "" }, form.fields)
+  end
+
+  # A submit button carries a value only when the server distinguishes two of
+  # them ("Sign in" vs "Cancel"). One with none contributes no field, and
+  # sending an empty string under its name can read as the button that was not
+  # pressed.
+  def test_a_submit_button_is_only_a_field_when_it_carries_a_value
+    fields = Form.all(<<~HTML).first.fields
+      <form action="/login">
+        <input type="hidden" name="tok" value="t">
+        <input type="submit" name="cancel">
+        <input type="SUBMIT" name="action" value="signin">
+      </form>
+    HTML
+
+    assert_equal({ "tok" => "t", "action" => "signin" }, fields)
   end
 
   def test_method_defaults_to_get
@@ -2223,6 +2352,19 @@ class PortalResultsTest < Minitest::Test
     assert_nil r.critical_low
     refute r.critical?
     assert_equal "LOW", r.flag
+  end
+
+  # A qualitative result can sit inside a panel that does publish critical
+  # bounds. There is no number to compare, so the answer is "not critical"
+  # rather than a comparison against nil.
+  def test_a_result_with_no_number_is_never_critical
+    r = result("resultValues" => [value("NEGATIVE")],
+      "referenceRanges" => { "criticalLow" => value("2.5"), "criticalHigh" => value("6.5") })
+
+    assert_nil r.number
+    refute r.critical?
+    assert_equal :unknown, r.status
+    assert_equal "", r.flag
   end
 
   def test_a_result_type_with_earlier_values_is_marked_truncated

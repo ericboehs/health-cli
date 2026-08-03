@@ -374,6 +374,18 @@ class TokenStoreTest < Minitest::Test
     refute s.exist?
   end
 
+  # An empty file is not a corrupt one: `write` truncates before it encrypts,
+  # so a run interrupted between the two leaves this behind. Nothing is stored,
+  # which is what "no tokens" already means.
+  def test_an_empty_store_reads_as_no_tokens
+    s = store
+    s.path.write("")
+    assert_nil s.read
+
+    s.path.write("   \n")
+    assert_nil s.read
+  end
+
   def test_corrupt_store_gives_actionable_error
     s = store
     s.path.write("}}} not json")
@@ -432,6 +444,16 @@ class TokenStoreTest < Minitest::Test
 
   def test_summary_for_nil
     refute Health::TokenStore.summary(nil)["authenticated"]
+  end
+
+  # A store written before `expires_at` was recorded has no expiry to count
+  # down from. Reporting nil says so; subtracting from zero would claim the
+  # token expired in 1970 and send `auth status` to a re-login it may not need.
+  def test_summary_reports_no_countdown_when_no_expiry_was_stored
+    summary = Health::TokenStore.summary({ "access_token" => "a" })
+
+    assert_nil summary["access_token_expires_in"]
+    assert summary["authenticated"]
   end
 
   def test_redact_replaces_secret_keys
@@ -505,16 +527,29 @@ class TokenStoreTenantTest < Minitest::Test
 
   # Deleting either of these would throw away a refresh token that may still
   # work, so they are left where they are for `auth login` to supersede.
+  #
+  # And they are left loudly. Both outcomes end with a usable grant on disk
+  # under a name nothing reads any more, while the next command reports "not
+  # signed in" — true of the new path, false of the record. The line naming the
+  # file is the whole difference between a puzzle and a `mv`, so it is asserted
+  # here rather than left to the reader of the source.
   def test_a_legacy_store_that_names_no_tenant_or_will_not_parse_is_left_in_place
     legacy = Health::Config.legacy_token_path
+    io = StringIO.new
 
     legacy.write(JSON.generate("access_token" => "a"))
+    # No io is the ordinary case — `auth` supplies one, a direct caller need
+    # not — and it must still decline to delete rather than blow up.
     assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new)
+    assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new, io: io)
     assert legacy.exist?
+    assert_match(/#{Regexp.escape(legacy.to_s)} names no tenant/, io.string)
 
     legacy.write("}}} not json")
     assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new)
+    assert_nil Health::TokenStore.migrate_legacy!(config, encryption: Crypto.new, io: io)
     assert legacy.exist?
+    assert_match(/could not move #{Regexp.escape(legacy.to_s)}/, io.string)
   end
 end
 
@@ -2479,6 +2514,43 @@ def test_nothing_is_said_about_truncation_when_there_is_none
   refute_match(/earlier values/, err)
 end
 
+def test_the_truncation_notice_agrees_with_itself_when_several_are_truncated
+  payload = { "items" => [{ "name" => "CBC", "resultTypes" => [
+    { "name" => "Hct", "hasMore" => true, "results" => [
+      { "name" => "Hct", "resultValues" => [{ "value" => "40.2" }] }
+    ] },
+    { "name" => "Hgb", "hasMore" => true, "results" => [
+      { "name" => "Hgb", "resultValues" => [{ "value" => "14.1" }] }
+    ] }
+  ] }] }
+
+  _code, _out, err = run_labs([], payload: payload)
+  assert_match(/2 of them have earlier values on record/, err)
+end
+
+# The two counts in the summary are not a partition: a qualitative result and
+# one the portal ships no range for are in neither. Without this line "0
+# outside the range" would imply they had been checked and passed.
+def test_results_that_could_not_be_checked_are_counted_separately
+  payload = { "items" => [{ "name" => "CBC", "resultTypes" => [
+    { "name" => "Culture", "results" => [
+      { "name" => "Culture", "resultValues" => [{ "value" => "NEGATIVE" }],
+        "performedDateTime" => "2026-01-15T15:53:00Z" }
+    ] },
+    { "name" => "Hct", "results" => [
+      { "name" => "Hct", "resultValues" => [{ "value" => "41.0", "units" => "%" }],
+        "referenceRanges" => { "normalLow" => { "value" => "38" }, "normalHigh" => { "value" => "50" } },
+        "performedDateTime" => "2026-01-15T15:53:00Z" }
+    ] }
+  ] }] }
+
+  _code, out, err = run_labs([], payload: payload)
+
+  assert_includes out, "NEGATIVE"
+  assert_match(/2 results, 0 outside the stated reference range/, err)
+  assert_match(/1 could not be checked — no reference range, or not a single number\./, err)
+end
+
 def test_quiet_drops_the_summary
   _code, _out, err = run_labs([], quiet: true)
   assert_empty err
@@ -2508,6 +2580,16 @@ def test_nothing_matching_is_reported_without_failing
   assert_equal 0, code
   assert_empty out
   assert_match(/no results matched/, err)
+end
+
+# --quiet exists so this can be run from a script that only cares about the
+# exit code, and "no results matched" is part of the summary it suppresses.
+def test_quiet_says_nothing_when_nothing_matched
+  code, out, err = run_labs(["--panel", "nope"], quiet: true)
+
+  assert_equal 0, code
+  assert_empty out
+  assert_empty err
 end
 
 def test_nothing_matching_is_an_empty_json_array
@@ -2619,6 +2701,46 @@ end
     assert_match(/asked for "Hgb" but the portal returned hct/, err.message)
   end
 
+  # The check is on names disagreeing, not on names being absent. A payload
+  # whose rows carry no label at all says nothing about which analyte it holds,
+  # and refusing to print it would turn a cosmetic gap in the feed into a
+  # blocked command.
+  def test_a_history_that_names_nothing_is_not_read_as_a_mispairing
+    unnamed = { "items" => HISTORY["items"].map { |r| r.reject { |k, _| %w[name type].include?(k) } } }
+    @record = FakeRecord.new(PAYLOAD, history: unnamed, index: INDEX)
+    global = Health::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    cmd = Health::Commands::Labs.new(global, io: StringIO.new, err: StringIO.new,
+      record_factory: ->(_config, _log) { @record })
+
+    def @record.history(uuid)
+      @asked_for = uuid
+      @history
+    end
+
+    assert_equal 0, cmd.run(["--history", "Hct"])
+  end
+
+  # The two spellings are the page's heading and the payload's own name for one
+  # analyte, and containment accepts them whichever side is the longer.
+  def test_a_longer_name_on_either_side_still_pairs
+    @record = FakeRecord.new(PAYLOAD, index: INDEX)
+    global = Health::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    cmd = Health::Commands::Labs.new(global, io: StringIO.new, err: StringIO.new,
+      record_factory: ->(_config, _log) { @record })
+
+    # The index reads "Hgb A1c" off the page; the payload calls it "A1c". The
+    # request is the longer of the two here, which is the direction a check
+    # written as "the answer must contain the question" would reject.
+    def @record.history(uuid)
+      @asked_for = uuid
+      { "items" => [{ "name" => "A1c", "type" => "A1c",
+                      "resultValues" => [{ "value" => "5.4", "units" => "%" }],
+                      "performedDateTime" => "2026-01-15T15:53:00Z" }] }
+    end
+
+    assert_equal 0, cmd.run(["--history", "Hgb A1c"])
+  end
+
   def test_history_still_honours_a_window_and_the_abnormal_filter
     _code, out = run_labs(["--history", "Hct", "--since", "2020-01-01", "--abnormal"])
 
@@ -2718,7 +2840,13 @@ class PortalSessionStoreTest < Minitest::Test
     store.save(jar: jar_with("cloud-session=abc"), person_id: "PERSON1")
     File.write(store.path, "{ not json")
 
+    # Without somewhere to say it, still nil rather than an exception — this is
+    # the path every non-verbose run takes.
     assert_nil store.load
+
+    io = StringIO.new
+    assert_nil store.load(io: io)
+    assert_match(/cached session is unreadable/, io.string)
   end
 
   def test_a_cache_without_a_person_is_treated_as_absent
@@ -2726,13 +2854,20 @@ class PortalSessionStoreTest < Minitest::Test
     assert_nil store.load
   end
 
-  def test_a_failed_decrypt_is_treated_as_absent
+  # Same outcome as an expiry — sign in again — but not the same problem. A
+  # moved SSH key or a missing `age` lands here and no number of sign-ins will
+  # fix it, so the reason has to survive rather than be swallowed with the nil.
+  def test_a_failed_decrypt_is_treated_as_absent_and_says_why
     failing = Class.new do
       def decrypt(*) = raise(Health::Encryption::Error, "age decrypt failed")
     end.new
     File.write(SessionStore.new(config).path, "whatever")
 
     assert_nil store(encryption: failing).load
+
+    io = StringIO.new
+    assert_nil store(encryption: failing).load(io: io)
+    assert_match(/could not be decrypted \(age decrypt failed\)/, io.string)
   end
 
   def test_rows_that_are_not_cookies_are_skipped

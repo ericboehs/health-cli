@@ -7,10 +7,11 @@ module Health
     #
     # Two things about the payload are worth knowing before reading this:
     #
-    # It carries its own `normalcy` string, and that field is worthless: over
-    # the whole record it reads "Normal" for every result without exception —
-    # including results the same payload prints as sitting outside their own
-    # reference range, in both directions. It is a constant, not a signal. So
+    # It carries its own `normalcy` string, and across this record that field
+    # read "Normal" on every result observed — including ones the same payload
+    # prints as sitting outside their own reference range, in both directions.
+    # The field can evidently hold other values, so it isn't a literal constant;
+    # it just never disagreed with itself often enough to be worth trusting. So
     # normalcy is always recomputed here from the reference range the payload
     # itself supplies, and the portal's claim is carried along unused, for
     # comparison.

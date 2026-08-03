@@ -61,8 +61,46 @@ module Health
       # up first.
       def history(opts)
         from, to = window(opts)
-        entry = resolve(record.history_index(from: from, to: to), opts)
-        Portal::Results.parse_history(record.history(entry.uuid), panel: entry.panel)
+        index = record.history_index(from: from, to: to)
+
+        # An empty index is not "you named an analyte your record doesn't have"
+        # — `resolve` would say that, as a usage error, and send the operator
+        # hunting for a typo in a spelling that was right. It means the results
+        # page stopped carrying the markup HistoryIndex reads.
+        if index.empty?
+          raise Portal::Error, "the results page carried no analyte history links — " \
+                               "the portal's markup has probably changed"
+        end
+
+        entry = resolve(index, opts)
+        results = Portal::Results.parse_history(record.history(entry.uuid), panel: entry.panel)
+        cross_check!(results, entry)
+        results
+      end
+
+      # The index pairs a name with an id by their order in the page's markup;
+      # the history payload names its own analyte. Comparing the two is the only
+      # available check that the pairing still holds, and it matters more than
+      # any other here: if it doesn't hold, the output is one analyte's values
+      # printed under another's name — the worst thing this tool can produce.
+      #
+      # Containment rather than equality, because the page's heading and the
+      # payload's name are two labels for one thing and needn't be spelled alike
+      # ("Hgb" against "Hgb A1c" is caught either way; the risk this guards is a
+      # wholesale mispairing, not a punctuation difference).
+      def cross_check!(results, entry)
+        wanted = entry.analyte.to_s.downcase
+        names = results.filter_map { |r| presence(r.analyte) }.uniq
+        return if wanted.empty? || names.empty?
+        return if names.all? { |n| n.include?(wanted) || wanted.include?(n) }
+
+        raise Portal::Error, "asked for #{entry.analyte.inspect} but the portal returned " \
+                             "#{names.join(", ")} — the results page markup has probably changed"
+      end
+
+      def presence(value)
+        text = value.to_s.downcase.strip
+        text.empty? ? nil : text
       end
 
       def resolve(index, opts)
@@ -88,8 +126,14 @@ module Health
         # The window is applied again here rather than trusted to the portal:
         # it is an undocumented query parameter, and a silently ignored one
         # would otherwise show results outside the range that was asked for.
-        results = results.select { |r| r.collected_on >= opts[:since].to_s } if opts[:since]
-        results = results.select { |r| r.collected_on <= opts[:until].to_s } if opts[:until]
+        #
+        # An undated result can't be placed in the window in either direction,
+        # so it is kept rather than dropped: the row prints its (blank) date and
+        # a reader can see what happened, where dropping makes a lab value
+        # vanish with no trace. Dates are ISO-8601, where string order is date
+        # order.
+        results = results.select { |r| r.collected_on.empty? || r.collected_on >= opts[:since].to_s } if opts[:since]
+        results = results.select { |r| r.collected_on.empty? || r.collected_on <= opts[:until].to_s } if opts[:until]
 
         results = results.select { |r| r.panel.to_s.downcase.include?(opts[:panel]) } if opts[:panel]
         results = results.select { |r| vitals?(r) == opts[:vitals] } if opts.key?(:vitals)
@@ -161,10 +205,19 @@ module Health
         # with this count and that difference is the whole point.
         @err.puts "#{results.size} #{noun}, #{out} outside the stated reference range (recomputed)."
 
+        # Without this the two counts read as a partition and they are not:
+        # qualitative results and results the portal ships no range for are in
+        # neither, and "0 outside the range" would otherwise imply they were
+        # checked and passed.
+        unchecked = results.count { |r| r.status == :unknown }
+        @err.puts "#{unchecked} could not be checked — no reference range, or not a single number." if unchecked.positive?
+
         earlier = results.count(&:truncated)
         return if earlier.zero?
 
-        @err.puts "#{earlier} of them have earlier values on record; see `health labs --history <analyte>`."
+        verb = (earlier == 1) ? "has" : "have"
+        @err.puts "#{earlier} of them #{verb} earlier values on record; " \
+                  "see `health labs --history <analyte>`."
       end
 
       def parse!(argv)

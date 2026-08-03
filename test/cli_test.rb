@@ -2334,9 +2334,16 @@ class FakeRecord
     @index
   end
 
+  # The real payload names its own analyte, and Labs compares that name against
+  # the one it looked the id up under. Handing back the same rows whatever was
+  # asked for would make this fake the one thing the cross-check exists to
+  # catch, so relabel to whichever analyte the id belongs to.
   def history(uuid)
     @asked_for = uuid
-    @history
+    name = @index.find { |e| e.uuid == uuid }&.analyte
+    return @history unless name
+
+    { "items" => @history["items"].map { |row| row.merge("name" => name, "type" => name) } }
   end
 end
 
@@ -2434,7 +2441,7 @@ end
 # tool lying by omission.
 def test_truncated_history_is_disclosed
   _code, _out, err = run_labs([])
-  assert_match(/1 of them have earlier values on record/, err)
+  assert_match(/1 of them has earlier values on record/, err)
 end
 
 def test_nothing_is_said_about_truncation_when_there_is_none
@@ -2546,6 +2553,40 @@ end
   def test_an_unknown_analyte_is_a_usage_error
     err = assert_raises(Health::Commands::Args::BadArgument) { run_labs(["--history", "zzz"]) }
     assert_match(/no analyte matching "zzz"/, err.message)
+  end
+
+  # An index with nothing in it means the page stopped carrying the links
+  # HistoryIndex scrapes. Reporting that as "no analyte matching Hct" would be
+  # a usage error, and would send the reader looking for a typo in a spelling
+  # that was right.
+  def test_an_empty_index_blames_the_markup_rather_than_the_spelling
+    @record = FakeRecord.new(PAYLOAD, index: [])
+    global = Health::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    cmd = Health::Commands::Labs.new(global, io: StringIO.new, err: StringIO.new,
+      record_factory: ->(_config, _log) { @record })
+
+    err = assert_raises(Health::Portal::Error) { cmd.run(["--history", "Hct"]) }
+    assert_match(/no analyte history links/, err.message)
+  end
+
+  # The index pairs a name with an id by position in the markup. If that
+  # pairing ever slips, the output is one analyte's values under another's
+  # name — so the payload's own name is checked against what was asked for.
+  def test_a_history_naming_a_different_analyte_is_an_error
+    @record = FakeRecord.new(PAYLOAD, history: HISTORY)
+    global = Health::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    cmd = Health::Commands::Labs.new(global, io: StringIO.new, err: StringIO.new,
+      record_factory: ->(_config, _log) { @record })
+
+    # HISTORY is all Hct; ask for Hgb and the id lookup succeeds while the
+    # payload comes back naming something else.
+    def @record.history(uuid)
+      @asked_for = uuid
+      HISTORY
+    end
+
+    err = assert_raises(Health::Portal::Error) { cmd.run(["--history", "Hgb"]) }
+    assert_match(/asked for "Hgb" but the portal returned hct/, err.message)
   end
 
   def test_history_still_honours_a_window_and_the_abnormal_filter

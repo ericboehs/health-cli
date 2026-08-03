@@ -39,12 +39,24 @@ module Health
       # cookie jar lives on `client`.
       def call
         res = @client.get(@entry)
+        submitted = false
 
         MAX_STEPS.times do
           body = res.body.to_s
 
           if (form = Form.with_field(body, "login_password"))
+            # Being shown the login form a second time means the first
+            # submission was rejected. Walking the loop would resend the same
+            # password up to MAX_STEPS times, which is how an account gets
+            # locked out — and this is a medical IdP, where a lockout costs a
+            # phone call. Fail on the first rejection instead.
+            if submitted
+              raise Error, "the portal rejected the stored credentials — " \
+                           "check the username and password in 1Password"
+            end
+
             log "submitting credentials"
+            submitted = true
             res = submit(form, res.uri, {})
             next
           end
@@ -71,8 +83,10 @@ module Health
 
       def submit(form, page_uri, overrides)
         fields = form.fields.merge(overrides)
-        # Filled here rather than in `overrides` so the password is never held
-        # in an instance variable any longer than the request itself.
+        # Read off @credentials only at the moment of the request. That object
+        # does hold the password for its own lifetime — see Credentials, which
+        # keeps it out of `inspect` for exactly that reason — but it never
+        # reaches this class's own state, a log line, or a retry.
         if form.field?("login_password")
           fields["login_username"] = @credentials.username
           fields["login_password"] = @credentials.password

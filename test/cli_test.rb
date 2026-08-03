@@ -1796,13 +1796,16 @@ class PortalLoginTest < Minitest::Test
     assert_equal ["/pages/health_record/results", "/health-record/results/"], @stub.requests.map(&:path)
   end
 
-  # If the provider ever loops the login form back at us, the walk has to stop
-  # rather than spin.
-  def test_a_login_form_that_never_advances_stops_after_max_steps
+  # Being handed the login form back is the IdP rejecting the credentials.
+  # Stopping at MAX_STEPS would be enough to avoid spinning, but not enough:
+  # each lap resends the same password, and this provider locks accounts. So
+  # the assertion is exactly one submission, not a bounded number of them.
+  def test_a_rejected_login_is_not_retried
     serve("POST /login" => [200, LOGIN_PAGE])
 
-    assert_raises(Login::Error) { login.call }
-    assert_equal Login::MAX_STEPS + 1, @stub.requests.count { |r| r.path == "/login" || r.path.end_with?("results") }
+    err = assert_raises(Login::Error) { login.call }
+    assert_match(/rejected the stored credentials/, err.message)
+    assert_equal 1, @stub.requests.count { |r| r.path == "/login" }
   end
 end
 

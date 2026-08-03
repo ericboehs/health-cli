@@ -62,7 +62,9 @@ module Health
 
         code = await_code(server, expected_state: state)
       ensure
-        server.close unless server.closed?
+        # `close` is a no-op on an already-closed socket, so the guard this
+        # used to carry only described a state nothing here can produce.
+        server.close
       end
 
       exchange_code(code, verifier: verifier)
@@ -142,7 +144,10 @@ module Health
       body = parse_json(res.body)
 
       unless res.is_a?(Net::HTTPSuccess)
-        detail = body.is_a?(Hash) ? [body["error"], body["error_description"]].compact.join(": ") : nil
+        # `parse_json` already guarantees a Hash, so this needs no shape check
+        # of its own — and the nil one used to produce here would have raised
+        # NoMethodError on the next line rather than the error it was reporting.
+        detail = [body["error"], body["error_description"]].compact.join(": ")
         raise Error, "token request failed (HTTP #{res.code})#{detail.empty? ? "" : " — #{detail}"}"
       end
 
@@ -199,7 +204,7 @@ module Health
           respond(conn, 200, "health-cli is authorized. You can close this tab.")
           return params["code"]
         ensure
-          conn.close unless conn.closed?
+          conn.close
         end
       end
     end

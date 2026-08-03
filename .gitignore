@@ -2,3 +2,6 @@
 *.age
 *.gem
 .DS_Store
+
+# Local working notes: contains provider and record details, never published.
+BRIEF.md

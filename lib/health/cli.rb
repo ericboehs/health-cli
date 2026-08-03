@@ -17,6 +17,7 @@ module Health
         0
       when "auth"   then Commands::Auth.new(global).run(argv)
       when "config" then Commands::Config.new(global).run(argv)
+      when "labs"   then Commands::Labs.new(global).run(argv)
       else
         warn "unknown command: #{cmd}"
         warn help_text
@@ -25,7 +26,7 @@ module Health
     rescue Commands::Args::BadArgument => e
       warn "health: #{e.message}"
       2
-    rescue Health::Config::Error, Encryption::Error, TokenStore::Error, OAuth::Error => e
+    rescue Health::Config::Error, Encryption::Error, TokenStore::Error, OAuth::Error, Portal::Error => e
       warn "health: #{e.message}"
       1
     rescue Interrupt
@@ -60,6 +61,9 @@ module Health
           auth refresh   Force a token refresh
           auth logout    Delete the encrypted token store
 
+        Record:
+          labs           Latest value per analyte, with reference ranges
+
         Other:
           config init    Write a starter config
           config show    Print the config as stored
@@ -74,6 +78,15 @@ module Health
 
         Auth flags:
           --tenant NAME  One of: #{Health::Config::TENANTS.keys.join(", ")}, or a tenant id
+
+        Labs flags:
+          --since DATE   Only results on or after DATE (YYYY-MM-DD)
+          --until DATE   Only results on or before DATE (YYYY-MM-DD)
+          --panel TEXT   Only panels whose name contains TEXT
+          --abnormal     Only results outside their reference range
+          --vitals       Only vitals (BP, pulse, weight, BMI)
+          --no-vitals    Only labs
+          --history NAME Every recorded draw of one analyte, newest first
       HELP
     end
   end

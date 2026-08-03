@@ -23,7 +23,8 @@ module Health
           raise Args::BadArgument, "unknown auth subcommand: #{sub} (expected: #{SUBCOMMANDS.join(", ")})"
         end
 
-        session = @session_factory.call(Health::Config.load, tenant)
+        @config = Health::Config.load
+        session = @session_factory.call(@config, tenant)
         send(sub, session)
       rescue Session::NotAuthenticated => e
         @err.puts "health: #{e.message}"
@@ -78,7 +79,15 @@ module Health
       def logout(session)
         existed = session.store.exist?
         session.logout!
+
+        # The cached portal session is a second live credential to the same
+        # record; "signed out" has to mean both of them are gone.
+        portal = Portal::SessionStore.new(@config)
+        portal_existed = portal.exist?
+        portal.clear
+
         @io.puts(existed ? "Signed out; token store removed." : "No token store to remove.")
+        @io.puts "Cached portal session removed." if portal_existed
         0
       end
 

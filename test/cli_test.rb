@@ -989,6 +989,17 @@ class CLITest < Minitest::Test
     assert_match(/config not found/, err)
   end
 
+  # A discovery fetch against a host that does not resolve. The point is that
+  # the operator gets a sentence rather than a backtrace: Net::HTTP frames
+  # print the request URL, which on a record endpoint carries the person id.
+  def test_an_unreachable_host_is_a_message_not_a_backtrace
+    write_config("client_id" => "x", "fhir_host" => "https://unresolvable.invalid/r4")
+    code, _out, err = capture { Health::CLI.run(["auth", "login"]) }
+
+    assert_equal 1, code
+    assert_match(/could not reach the server/, err)
+  end
+
   def test_config_init_then_show
     code, out, = capture { Health::CLI.run(["config", "init", "cid-123"]) }
     assert_equal 0, code

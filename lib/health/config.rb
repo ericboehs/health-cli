@@ -3,9 +3,11 @@ require "fileutils"
 require "pathname"
 require "open3"
 
+require "health/error"
+
 module Health
   class Config
-    class Error < RuntimeError; end
+    class Error < Health::Error; end
 
     # Oracle Health Millennium patient-persona tenants. Aliases exist because
     # "which tenant is mine" is not knowable up front — the three UHS Ambulatory

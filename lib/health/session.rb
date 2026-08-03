@@ -1,9 +1,11 @@
+require "health/error"
+
 module Health
   # What every future resource command will actually depend on: "give me a
   # usable access token." Keeps refresh-vs-reauth logic in one place so no
   # command has to reason about 570-second expiry.
   class Session
-    class NotAuthenticated < RuntimeError; end
+    class NotAuthenticated < Health::Error; end
 
     def initialize(config, tenant: nil, store: nil, oauth: nil, io: $stderr)
       @config = config

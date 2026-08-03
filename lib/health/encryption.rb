@@ -1,12 +1,14 @@
 require "open3"
 
+require "health/error"
+
 module Health
   # age encryption against an SSH key, mirroring the pattern already proven in
   # github.com/ericboehs/slk. Encrypting to a *key* rather than a
   # passphrase is what keeps `health` non-interactive: reads need the private
   # key on disk, not a prompt.
   class Encryption
-    class Error < RuntimeError; end
+    class Error < Health::Error; end
 
     SUPPORTED_KEY_TYPES = %w[ssh-rsa ssh-ed25519].freeze
 

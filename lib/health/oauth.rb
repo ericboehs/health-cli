@@ -6,13 +6,15 @@ require "openssl"
 require "securerandom"
 require "fileutils"
 
+require "health/error"
+
 module Health
   # SMART on FHIR standalone-patient authorization-code flow, hand-rolled on
   # stdlib. No fhir_client: its OAuth support is the client-credentials flow
   # (wrong grant), it has no PKCE, and it costs ~1s of startup for a CLI whose
   # whole point is being fast.
   class OAuth
-    class Error < RuntimeError; end
+    class Error < Health::Error; end
     class Denied < Error; end
 
     DISCOVERY_TTL = 86_400 # SMART config changes ~never; a day is plenty.

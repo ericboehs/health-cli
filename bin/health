@@ -6,6 +6,7 @@ require "pathname"
 ROOT = Pathname(__dir__).join("..").realpath
 $LOAD_PATH.unshift(ROOT.join("lib").to_s)
 
+require "health/error"
 require "health/config"
 require "health/encryption"
 require "health/token_store"

@@ -1,9 +1,24 @@
+require "net/http"
+require "openssl"
+require "uri"
+
+require "health/error"
+
 module Health
   # A Data object rather than a Hash so a typo like `@global.jsn` raises instead
   # of quietly reading nil.
   GlobalOptions = Data.define(:json, :quiet, :verbose)
 
   class CLI
+    # Everything that can go wrong between this process and the provider.
+    # SystemCallError covers the Errno family (ECONNREFUSED, EHOSTUNREACH…) in
+    # one entry.
+    NETWORK_ERRORS = [
+      SocketError, IOError, SystemCallError,
+      Net::OpenTimeout, Net::ReadTimeout, Net::HTTPBadResponse, Net::ProtocolError,
+      OpenSSL::SSL::SSLError, URI::Error
+    ].freeze
+
     def self.run(argv) = new.run(argv)
 
     def run(argv)
@@ -26,8 +41,16 @@ module Health
     rescue Commands::Args::BadArgument => e
       warn "health: #{e.message}"
       2
-    rescue Health::Config::Error, Encryption::Error, TokenStore::Error, OAuth::Error, Portal::Error => e
+    # One ancestor rather than a list of classes: see Health::Error for why an
+    # unlisted error class is worse here than in most programs.
+    rescue Health::Error => e
       warn "health: #{e.message}"
+      1
+    # Nothing between here and the provider is under this tool's control, and a
+    # backtrace out of Net::HTTP would print the request URL — which carries the
+    # person id — into whatever the operator pastes into a bug report.
+    rescue *NETWORK_ERRORS => e
+      warn "health: could not reach the server (#{e.class}: #{e.message})"
       1
     rescue Interrupt
       warn "\nhealth: interrupted"

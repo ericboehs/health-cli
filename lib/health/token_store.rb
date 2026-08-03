@@ -1,12 +1,14 @@
 require "json"
 require "time"
 
+require "health/error"
+
 module Health
   # The age-encrypted token store. Everything PHI-adjacent that persists goes
   # through here; nothing in this class ever prints a token value, and callers
   # get `summary` rather than the raw hash when they want to show state.
   class TokenStore
-    class Error < RuntimeError; end
+    class Error < Health::Error; end
 
     # Access tokens are minted with expires_in=570 (9.5 min). Refresh a little
     # early so a long-running command doesn't expire mid-pagination.

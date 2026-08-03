@@ -82,13 +82,17 @@ module XDGSandbox
   # it exercises the real Open3 call rather than asserting against a mock of it.
   # Passing a nil script leaves PATH empty, which is how "op isn't installed"
   # is reproduced.
-  def with_fake_op(script)
+  def with_fake_op(script, &block) = with_fake_bin("op", script, &block)
+
+  # PATH holds nothing but the fake, so a script may only use shell builtins —
+  # and a nil script leaves PATH empty, which is how "not installed" is tested.
+  def with_fake_bin(name, script)
     bin = Pathname(@tmp).join("bin")
     bin.mkpath
     if script
-      op = bin.join("op")
-      op.write("#!/bin/sh\n#{script}\n")
-      op.chmod(0o755)
+      fake = bin.join(name)
+      fake.write("#!/bin/sh\n#{script}\n")
+      fake.chmod(0o755)
     end
     old = ENV["PATH"]
     ENV["PATH"] = bin.to_s
@@ -1864,6 +1868,122 @@ class PortalCredentialsTest < Minitest::Test
       err = assert_raises(Credentials::Error) { Credentials.load }
       assert_match(/not installed/, err.message)
     end
+  end
+
+  # --------------------------------------------------------------- keychain
+
+  def keychain_config(**extra)
+    config("portal" => { "source" => "keychain" }.merge(extra))
+  end
+
+  # `security` puts the attributes on stdout and the password on stderr.
+  def security_returning(password, acct: '"portal-user"')
+    "echo \"$@\" > #{@tmp}/argv\n" \
+      "echo '    \"acct\"<blob>=#{acct}'\n" \
+      "echo 'password: #{password}' >&2"
+  end
+
+  def test_keychain_reads_both_fields_from_one_call
+    with_fake_bin("security", security_returning('"hunter2"')) do
+      creds = Credentials.load(keychain_config)
+
+      assert_equal "portal-user", creds.username
+      assert_equal "hunter2", creds.password
+      argv = File.read("#{@tmp}/argv")
+      assert_includes argv, "find-generic-password"
+      assert_includes argv, Credentials::DEFAULT_SERVICE
+      assert_includes argv, "-g"
+    end
+  end
+
+  def test_the_keychain_service_and_account_are_configurable
+    cfg = keychain_config("keychain_service" => "portal.test", "keychain_account" => "someone@example.test")
+
+    with_fake_bin("security", security_returning('"hunter2"', acct: '"ignored"')) do
+      creds = Credentials.load(cfg)
+
+      # A configured account is what was searched for, so it is also the
+      # username — no need to read back what we just asked by.
+      assert_equal "someone@example.test", creds.username
+      argv = File.read("#{@tmp}/argv")
+      assert_includes argv, "-s portal.test"
+      assert_includes argv, "-a someone@example.test"
+    end
+  end
+
+  # `security` hex-encodes anything that is not printable ASCII, and a password
+  # is exactly where a non-ASCII character is likely to turn up.
+  def test_a_hex_encoded_password_is_decoded
+    hex = "0x#{"pä$$wörd".unpack1("H*").upcase}"
+
+    with_fake_bin("security", security_returning("#{hex}  \"p\\303\\244...\"")) do
+      assert_equal "pä$$wörd", Credentials.load(keychain_config).password
+    end
+  end
+
+  def test_a_non_ascii_account_is_decoded_too
+    hex = "0x#{"éric".unpack1("H*").upcase}"
+
+    with_fake_bin("security", security_returning('"hunter2"', acct: hex)) do
+      assert_equal "éric", Credentials.load(keychain_config).username
+    end
+  end
+
+  # `security` does not escape a quote inside the quoted form — a password of
+  # say "hi" prints verbatim as `password: "say "hi""` — so the closing quote
+  # is the last one on the line, not the first. (A backslash is a different
+  # matter: it pushes the whole value onto the hex path above.)
+  def test_a_quoted_password_is_read_to_the_last_quote
+    with_fake_bin("security", security_returning('"say "hi""')) do
+      assert_equal 'say "hi"', Credentials.load(keychain_config).password
+    end
+  end
+
+  def test_a_missing_keychain_item_is_reported_with_the_service_name
+    script = "echo 'security: SecKeychainSearchCopyNext: The specified item could not be found.' >&2\nexit 44"
+
+    with_fake_bin("security", script) do
+      err = assert_raises(Credentials::Error) { Credentials.load(keychain_config) }
+
+      assert_match(/Keychain lookup failed for "cernerhealth.com"/, err.message)
+      assert_match(/could not be found/, err.message)
+    end
+  end
+
+  # Every other source in this class can quote stderr into an error message.
+  # This one cannot: stderr is where the password is.
+  def test_a_keychain_failure_never_quotes_the_password_into_the_message
+    script = "echo 'password: \"hunter2\"' >&2\necho 'security: something went wrong' >&2\nexit 1"
+
+    with_fake_bin("security", script) do
+      err = assert_raises(Credentials::Error) { Credentials.load(keychain_config) }
+
+      refute_includes err.message, "hunter2"
+      assert_match(/something went wrong/, err.message)
+    end
+  end
+
+  def test_an_item_with_no_account_and_none_configured_is_an_error
+    with_fake_bin("security", "echo 'password: \"hunter2\"' >&2") do
+      err = assert_raises(Credentials::Error) { Credentials.load(keychain_config) }
+      assert_match(/Keychain item "cernerhealth.com" is missing a username or password/, err.message)
+    end
+  end
+
+  def test_a_missing_security_cli_is_reported_as_such
+    with_fake_bin("security", nil) do
+      err = assert_raises(Credentials::Error) { Credentials.load(keychain_config) }
+      assert_match(/`security` CLI, which is not installed/, err.message)
+    end
+  end
+
+  def test_an_unknown_source_names_the_two_that_exist
+    err = assert_raises(Credentials::Error) do
+      Credentials.load(config("portal" => { "source" => "gnome-keyring" }))
+    end
+
+    assert_match(/unknown portal credential source "gnome-keyring"/, err.message)
+    assert_match(/"op" or "keychain"/, err.message)
   end
 
   # The password must not be reachable through the paths that end up in logs,

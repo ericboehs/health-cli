@@ -67,8 +67,36 @@ Point it elsewhere with:
 { "portal": { "op_item": "cernerhealth.com (me)", "op_vault": "Private" } }
 ```
 
-The password is fetched at the moment it is posted and is never written to disk,
-a log line, or `inspect`.
+The macOS Keychain works too, if you would rather not approve a biometric
+prompt:
+
+```json
+{ "portal": { "source": "keychain", "keychain_service": "cernerhealth.com" } }
+```
+
+Add `keychain_account` if more than one item shares the service name; without
+it, the item's own account is the username, which keeps it out of a config file
+that is not encrypted. Create the item with `-T /usr/bin/security`, or every
+read raises a GUI prompt and the point is lost:
+
+```sh
+security add-generic-password -s cernerhealth.com -a you@example.com \
+  -T /usr/bin/security -w
+```
+
+`-w` must come last and take no value: that is what makes `security` prompt for
+the password instead of reading it from a command line that your shell history
+would keep.
+
+Know what that trades. `op` gates the password behind Touch ID every time;
+`-T /usr/bin/security` gates it behind "anything running as this user can shell
+out to `security`" — the same bar the token store already sits at. The password
+is the root credential, it does not expire, and a Keychain item does not sync to
+your other machines. Given the portal session is cached, `op` runs seldom enough
+that the prompt is cheap. `op` stays the default for those reasons.
+
+Either way the password is fetched at the moment it is posted and is never
+written to disk, a log line, or `inspect`.
 
 ## Usage
 

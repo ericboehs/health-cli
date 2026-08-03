@@ -781,6 +781,29 @@ class OAuthNetworkTest < Minitest::Test
     assert_match(/no access_token/, err.message)
   end
 
+  # `null`, `[]`, `"str"` and `0` are all valid JSON, and every caller here
+  # indexes the parsed body by key. A token endpoint answering with any of them
+  # used to raise NoMethodError or TypeError — neither an OAuth::Error, and
+  # both past the top-level rescue as a backtrace.
+  def test_a_json_body_that_is_not_an_object_is_an_oauth_error
+    ["null", "[]", '"nope"', "0"].each do |body|
+      cfg = token_config("POST /token" => [200, body])
+      err = assert_raises(Health::OAuth::Error) do
+        Health::OAuth.new(cfg, io: StringIO.new).refresh("RT")
+      end
+      assert_match(/no access_token/, err.message)
+      @stub.stop
+    end
+  end
+
+  def test_a_failure_body_that_is_not_an_object_still_reports_the_status
+    cfg = token_config("POST /token" => [400, "[]"])
+    err = assert_raises(Health::OAuth::Error) do
+      Health::OAuth.new(cfg, io: StringIO.new).refresh("RT")
+    end
+    assert_match(/HTTP 400/, err.message)
+  end
+
   # ---- discovery ---------------------------------------------------------
 
   def discovery_config(routes)

@@ -279,8 +279,13 @@ module Health
       end
     end
 
+    # Always a Hash. `null`, `[]`, `"str"` and `0` are all valid JSON, and every
+    # caller here indexes the result by key — so a token endpoint answering with
+    # a non-object used to raise NoMethodError or TypeError, neither of which is
+    # an OAuth::Error, and both of which escaped the top-level rescue.
     def parse_json(body)
-      JSON.parse(body.to_s)
+      parsed = JSON.parse(body.to_s)
+      parsed.is_a?(Hash) ? parsed : {}
     rescue JSON::ParserError
       {}
     end

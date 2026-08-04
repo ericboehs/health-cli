@@ -36,6 +36,8 @@ require "health/portal/record"
 require "health/portal/results"
 require "health/portal/history_index"
 require "health/commands/labs"
+require "health/fhir"
+require "health/fhir/client"
 
 # Every test runs against a throwaway XDG root so nothing touches the real
 # ~/.config/health or, more importantly, a real token store.
@@ -3257,3 +3259,322 @@ class PortalRecordSessionTest < Minitest::Test
     refute cache.exist?
   end
 end
+
+# ---------------------------------------------------------------- FHIR helpers
+
+class FHIRHelpersTest < Minitest::Test
+  def display(concept) = Health::FHIR.display(concept)
+
+  def test_a_nil_concept_has_no_display
+    assert_nil display(nil)
+  end
+
+  # Some fields in these payloads are CodeableConcepts and some are already
+  # plain strings; callers shouldn't have to know which.
+  def test_a_string_is_its_own_display
+    assert_equal "oral", display("oral")
+  end
+
+  def test_text_beats_every_coding
+    concept = { "text" => "what the chart says",
+                "coding" => [{ "display" => "what the terminology says" }] }
+    assert_equal "what the chart says", display(concept)
+  end
+
+  # The clinician's own selection is a statement about what happened; a mapped
+  # coding is a statement about a code system.
+  def test_the_user_selected_coding_wins_over_a_mapped_one
+    concept = { "coding" => [
+      { "display" => "Fluzone Quadrivalent 2021-2022", "userSelected" => false },
+      { "display" => "influenza virus vaccine, inactivated", "userSelected" => true }
+    ] }
+    assert_equal "influenza virus vaccine, inactivated", display(concept)
+  end
+
+  # userSelected with nothing to show is not a selection worth honouring.
+  def test_a_user_selected_coding_with_no_display_is_skipped
+    concept = { "coding" => [
+      { "display" => "", "userSelected" => true },
+      { "display" => "Chest pain", "userSelected" => false }
+    ] }
+    assert_equal "Chest pain", display(concept)
+  end
+
+  def test_the_first_coding_with_a_display_is_used
+    concept = { "coding" => [{ "code" => "1" }, { "display" => "Asthma" }] }
+    assert_equal "Asthma", display(concept)
+  end
+
+  # A blank cell would read as "nothing recorded", which is a different fact
+  # from "recorded without a label".
+  def test_a_coding_with_no_display_falls_back_to_its_code
+    assert_equal "29857009", display("coding" => [{ "code" => "29857009" }])
+  end
+
+  def test_a_concept_with_no_codings_has_no_display
+    assert_nil display("coding" => [])
+  end
+
+  def test_a_coding_that_is_not_a_hash_is_ignored
+    assert_equal "Asthma", display("coding" => ["junk", { "display" => "Asthma" }])
+  end
+
+  def test_status_code_returns_the_code_not_the_display
+    concept = { "coding" => [{ "code" => "Active", "display" => "Active" }] }
+    assert_equal "active", Health::FHIR.status_code(concept)
+  end
+
+  def test_status_code_handles_a_bare_string_and_nil
+    assert_equal "final", Health::FHIR.status_code("final")
+    assert_nil Health::FHIR.status_code(nil)
+    assert_nil Health::FHIR.status_code("coding" => [])
+  end
+
+  # Instants, offset datetimes and plain dates all reduce to the calendar date.
+  def test_dates_reduce_to_the_calendar_day
+    assert_equal "2026-07-02", Health::FHIR.date("2026-07-02T18:19:40Z")
+    assert_equal "2021-11-15", Health::FHIR.date("2021-11-15T09:04:00-06:00")
+    assert_equal "2019-08-26", Health::FHIR.date("2019-08-26")
+    assert_nil Health::FHIR.date(nil)
+  end
+
+  def test_date_from_takes_the_first_field_that_has_one
+    resource = { "onsetDateTime" => "2019-08-26", "recordedDate" => "2020-01-01" }
+    assert_equal "2019-08-26", Health::FHIR.date_from(resource, "onsetDateTime", "recordedDate")
+    assert_equal "2020-01-01", Health::FHIR.date_from({ "recordedDate" => "2020-01-01" },
+      "onsetDateTime", "recordedDate")
+    assert_nil Health::FHIR.date_from({}, "onsetDateTime", "recordedDate")
+  end
+end
+
+# ------------------------------------------------------------- the FHIR client
+
+class FHIRClientTest < Minitest::Test
+  include XDGSandbox
+
+  def teardown
+    @stub&.stop
+    super
+  end
+
+  # A Session that hands back a fixed token without a store or a network.
+  class StubSession
+    attr_reader :calls
+
+    def initialize(tokens = { "patient" => "PT1" })
+      @tokens = tokens
+      @calls = 0
+    end
+
+    def tokens = @tokens
+
+    def access_token! = (@calls += 1) && "AT"
+  end
+
+  def bundle(resources, next_url: nil)
+    links = [{ "relation" => "self", "url" => "x" }]
+    links << { "relation" => "next", "url" => next_url } if next_url
+    JSON.generate("resourceType" => "Bundle", "link" => links,
+                  "entry" => resources.map { |r| { "resource" => r } })
+  end
+
+  def client_for(routes, tokens: { "patient" => "PT1" }, io: nil)
+    @stub = StubHTTP.new(routes)
+    @session = StubSession.new(tokens)
+    cfg = config("fhir_host" => "#{@stub.base}/r4", "tenant" => "t1")
+    Health::FHIR::Client.new(cfg, session: @session, io: io)
+  end
+
+  def query_of(request) = URI.decode_www_form(URI("http://x#{request.path}").query.to_s).to_h
+
+  def test_search_scopes_to_the_patient_and_asks_for_a_full_page
+    client = client_for({ "GET /r4/t1/Condition" => [200, bundle([{ "id" => "1" }])] })
+    resources = client.search("Condition")
+
+    assert_equal ["1"], resources.map { |r| r["id"] }
+    query = query_of(@stub.requests.first)
+    assert_equal "PT1", query["patient"]
+    assert_equal "100", query["_count"]
+    assert_equal "Bearer AT", @stub.requests.first.headers["authorization"]
+    assert_equal "application/fhir+json", @stub.requests.first.headers["accept"]
+  end
+
+  def test_extra_params_are_passed_through_and_nils_dropped
+    client = client_for({ "GET /r4/t1/Condition" => [200, bundle([])] })
+    client.search("Condition", "category" => "problem-list-item", "date" => nil)
+
+    query = query_of(@stub.requests.first)
+    assert_equal "problem-list-item", query["category"]
+    refute query.key?("date")
+  end
+
+  # A patient-scoped grant carries the id as launch context; without it there
+  # is nothing to search against and no useful request to make.
+  def test_a_grant_with_no_patient_context_is_refused
+    client = client_for({}, tokens: { "patient" => "" })
+    error = assert_raises(Health::FHIR::Error) { client.search("Condition") }
+    assert_match(/no patient context/, error.message)
+
+    empty = client_for({}, tokens: nil)
+    assert_raises(Health::FHIR::Error) { empty.search("Condition") }
+  end
+
+  def test_paging_follows_the_next_link_until_it_stops
+    page2 = nil
+    routes = {
+      "GET /r4/t1/MedicationRequest" => ->(_r) { [200, bundle([{ "id" => "1" }], next_url: page2)] },
+      "GET /r4/t1/page2" => [200, bundle([{ "id" => "2" }])]
+    }
+    client = client_for(routes)
+    page2 = "#{@stub.base}/r4/t1/page2"
+
+    assert_equal %w[1 2], client.search("MedicationRequest").map { |r| r["id"] }
+    assert_equal 2, @stub.requests.size
+  end
+
+  # A `next` link that is present but empty is not a next page.
+  def test_an_empty_next_link_ends_the_walk
+    routes = { "GET /r4/t1/Condition" => [200, bundle([{ "id" => "1" }], next_url: "")] }
+    client = client_for(routes)
+
+    assert_equal 1, client.search("Condition").size
+  end
+
+  def test_a_link_entry_that_is_not_a_hash_is_ignored
+    body = JSON.generate("link" => ["junk"], "entry" => [{ "resource" => { "id" => "1" } }])
+    client = client_for({ "GET /r4/t1/Condition" => [200, body] })
+
+    assert_equal 1, client.search("Condition").size
+  end
+
+  # This request carries a bearer token, so a URL out of a payload may only
+  # point where that token belongs.
+  def test_a_next_link_off_the_fhir_host_is_refused
+    routes = { "GET /r4/t1/Condition" => [200, bundle([], next_url: "https://evil.example/steal")] }
+    client = client_for(routes)
+
+    error = assert_raises(Health::FHIR::Error) { client.search("Condition") }
+    assert_match(/not the FHIR host/, error.message)
+    assert_match(/evil\.example/, error.message)
+  end
+
+  # A server whose `next` points back at the page just fetched would otherwise
+  # spin here until someone killed it.
+  def test_paging_gives_up_rather_than_looping_forever
+    here = nil
+    routes = { "GET /r4/t1/Condition" => ->(_r) { [200, bundle([], next_url: here)] } }
+    client = client_for(routes)
+    here = "#{@stub.base}/r4/t1/Condition"
+
+    error = assert_raises(Health::FHIR::Error) { client.search("Condition") }
+    assert_match(/did not stop paging/, error.message)
+  end
+
+  def test_entries_without_a_resource_are_skipped
+    body = JSON.generate("entry" => ["junk", { "no" => "resource" }, { "resource" => { "id" => "1" } }])
+    client = client_for({ "GET /r4/t1/Condition" => [200, body] })
+
+    assert_equal ["1"], client.search("Condition").map { |r| r["id"] }
+  end
+
+  def test_a_failure_reports_the_operation_outcome
+    outcome = JSON.generate("issue" => [{ "details" => { "text" => "Invalid request" } }])
+    client = client_for({ "GET /r4/t1/CarePlan" => [400, outcome] })
+
+    error = assert_raises(Health::FHIR::Error) { client.search("CarePlan") }
+    assert_match(/CarePlan request failed \(HTTP 400\)/, error.message)
+    assert_match(/Invalid request/, error.message)
+  end
+
+  def test_a_failure_falls_back_to_diagnostics_then_to_nothing
+    diagnostics = JSON.generate("issue" => [{ "diagnostics" => "The Accept Header is invalid" }])
+    client = client_for({ "GET /r4/t1/Condition" => [406, diagnostics] })
+    assert_match(/Accept Header/, assert_raises(Health::FHIR::Error) { client.search("Condition") }.message)
+
+    @stub.stop
+    bare = client_for({ "GET /r4/t1/Condition" => [500, JSON.generate("issue" => [{}])] })
+    assert_equal "Condition request failed (HTTP 500)",
+      assert_raises(Health::FHIR::Error) { bare.search("Condition") }.message
+
+    @stub.stop
+    none = client_for({ "GET /r4/t1/Condition" => [500, JSON.generate("issue" => ["junk"])] })
+    assert_equal "Condition request failed (HTTP 500)",
+      assert_raises(Health::FHIR::Error) { none.search("Condition") }.message
+  end
+
+  # A token endpoint answering with a non-object used to raise NoMethodError,
+  # which is not a Health::Error and escaped the top-level rescue.
+  def test_a_body_that_is_not_a_json_object_is_treated_as_empty
+    client = client_for({ "GET /r4/t1/Condition" => [500, "not json at all"] })
+    assert_equal "Condition request failed (HTTP 500)",
+      assert_raises(Health::FHIR::Error) { client.search("Condition") }.message
+
+    @stub.stop
+    array = client_for({ "GET /r4/t1/Condition" => [200, "[]"] })
+    assert_empty array.search("Condition")
+  end
+
+  def test_progress_goes_to_the_log_without_the_url
+    io = StringIO.new
+    client = client_for({ "GET /r4/t1/Condition" => [200, bundle([])] }, io: io)
+    client.search("Condition")
+
+    assert_match(/Condition: fetching page 1/, io.string)
+    # The query string carries the person id.
+    refute_match(/PT1/, io.string)
+  end
+
+  # --------------------------------------------------------------- attachments
+
+  def test_fetch_binary_returns_the_content_type_and_body
+    routes = { "GET /r4/t1/Binary/XR-1" => [200, "%PDF-1.4 body", { "Content-Type" => "application/pdf" }] }
+    client = client_for(routes)
+    type, body = client.fetch_binary("#{@stub.base}/r4/t1/Binary/XR-1", accept: "application/pdf")
+
+    assert_equal "application/pdf", type
+    assert_equal "%PDF-1.4 body", body
+    assert_equal "application/pdf", @stub.requests.last.headers["accept"]
+  end
+
+  # Millennium answers `*/*` with a 406, so the caller has to say back the type
+  # the DocumentReference advertised — and when it advertised none, the FHIR
+  # default is the only sensible ask.
+  def test_fetch_binary_falls_back_to_the_fhir_accept_header
+    routes = { "GET /r4/t1/Binary/XR-1" => [200, "x", { "Content-Type" => "application/pdf; charset=utf-8" }] }
+    client = client_for(routes)
+    type, = client.fetch_binary("#{@stub.base}/r4/t1/Binary/XR-1", accept: "  ")
+
+    assert_equal "application/fhir+json", @stub.requests.last.headers["accept"]
+    # The parameter is stripped off the returned type.
+    assert_equal "application/pdf", type
+  end
+
+  # Millennium lists documents it will not serve — intake forms 404 while the
+  # visit summary from the same encounter downloads.
+  def test_an_unreleased_document_says_so_rather_than_not_found
+    client = client_for({ "GET /r4/t1/Binary/XR-1" => [404, "{}"] })
+    error = assert_raises(Health::FHIR::Error) do
+      client.fetch_binary("#{@stub.base}/r4/t1/Binary/XR-1")
+    end
+
+    assert_match(/will not serve its contents/, error.message)
+    refute_match(/not found/i, error.message)
+  end
+
+  def test_another_download_failure_reports_its_status
+    client = client_for({ "GET /r4/t1/Binary/XR-1" => [403, "{}"] })
+    error = assert_raises(Health::FHIR::Error) do
+      client.fetch_binary("#{@stub.base}/r4/t1/Binary/XR-1")
+    end
+
+    assert_match(/could not download the document \(HTTP 403\)/, error.message)
+  end
+
+  def test_an_attachment_url_off_the_fhir_host_is_refused
+    client = client_for({})
+    error = assert_raises(Health::FHIR::Error) { client.fetch_binary("https://evil.example/x") }
+
+    assert_match(/not the FHIR host/, error.message)
+  end
+end
+

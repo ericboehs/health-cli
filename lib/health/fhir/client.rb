@@ -201,8 +201,19 @@ module Health
         return "" unless issue.is_a?(Hash)
 
         text = issue.dig("details", "text") || issue["diagnostics"]
-        text.to_s.empty? ? "" : " — #{text}"
+        text.to_s.empty? ? "" : " — #{redact(text)}"
       end
+
+      # Server-authored text goes into a message an operator may paste into a
+      # bug report, and Millennium echoes request parameters back in it
+      # ("Invalid patient id: …"). The diagnostic is worth keeping — it is how
+      # the 406 on Binary was diagnosed — but not at the cost of carrying the
+      # person id out with it.
+      #
+      # `patient_id` rather than a nil-tolerant lookup: this runs on the way
+      # back from a request that `search` only built because `patient_id`
+      # already answered.
+      def redact(text) = text.to_s.gsub(patient_id, "[patient]")
 
       def parse(body)
         parsed = JSON.parse(body.to_s)

@@ -3541,6 +3541,17 @@ class FHIRClientTest < Minitest::Test
     assert_raises(Health::FHIR::Error) { array.search("Condition") }
   end
 
+  # Millennium echoes request parameters back in OperationOutcome text, and
+  # this message is what an operator pastes into a bug report.
+  def test_an_error_detail_does_not_carry_the_patient_id_back_out
+    outcome = JSON.generate("issue" => [{ "diagnostics" => "Invalid search for patient PT1" }])
+    client = client_for({ "GET /r4/t1/Condition" => [400, outcome] })
+    message = assert_raises(Health::FHIR::Error) { client.search("Condition") }.message
+
+    assert_match(/Invalid search for patient \[patient\]/, message)
+    refute_match(/PT1/, message)
+  end
+
   def test_progress_goes_to_the_log_without_the_url
     io = StringIO.new
     client = client_for({ "GET /r4/t1/Condition" => [200, bundle([])] }, io: io)

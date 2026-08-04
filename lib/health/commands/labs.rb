@@ -34,9 +34,10 @@ module Health
         opts = parse!(argv.dup)
         results = select(opts[:history] ? history(opts) : fetch(opts), opts)
 
-        return emit_json(results) if @global.json
+        return emit_json(results, opts) if @global.json
 
         print_table(results, history: opts[:history])
+        print_trend(results) if opts[:trend]
         0
       end
 
@@ -149,9 +150,67 @@ module Health
 
       def vitals?(result) = VITALS.any? { |pattern| result.panel.to_s.match?(pattern) }
 
-      def emit_json(results)
-        @io.puts JSON.pretty_generate(results.map { |r| r.to_h.merge(status: r.status, critical: r.critical?) })
+      def emit_json(results, opts = {})
+        rows = results.map { |r| r.to_h.merge(status: r.status, critical: r.critical?) }
+
+        # `--trend` is the one flag that changes the JSON's shape rather than
+        # its contents, so it does so only when asked for: without it the
+        # document is the array it has always been, and with it the array moves
+        # under "results" beside the computed trend.
+        payload = opts[:trend] ? { trend: trend_of(results), results: rows } : rows
+        @io.puts JSON.pretty_generate(payload)
         0
+      end
+
+      # Oldest first, which is the direction a chart is read — the table above
+      # is newest first because that is the direction a result is read.
+      def trend_of(results)
+        series = results.reverse
+        numbers = series.map(&:number)
+        summary = Sparkline.summarize(numbers)
+        return nil if summary.nil?
+
+        summary.merge(
+          sparkline: Sparkline.render(numbers),
+          units: series.map(&:units).compact.reject(&:empty?).last,
+          # Safe without a nil guard: `summarize` returned non-nil, which takes
+          # two numbers, which takes at least two results.
+          from: series.first.collected_on,
+          to: series.last.collected_on
+        )
+      end
+
+      def print_trend(results)
+        trend = trend_of(results)
+        if trend.nil?
+          @err.puts "health: not enough numeric draws to plot a trend." unless @global.quiet
+          return
+        end
+
+        @io.puts "#{trend[:sparkline]}  #{describe(trend)}"
+        @io.puts
+      end
+
+      # The scale is printed with the picture, always. A sparkline is drawn
+      # against its own minimum and maximum, so an analyte that wandered by a
+      # tenth of a percent draws the same dramatic spike as one that doubled.
+      # Saying the span out loud is what keeps the shape from being read as a
+      # magnitude.
+      def describe(trend)
+        units = trend[:units].to_s.empty? ? "" : " #{trend[:units]}"
+        # Suppressed when nothing moved: "flat (+0.0%)" spends a clause saying
+        # the same thing twice.
+        percent = (trend[:percent] && !trend[:change].zero?) ? format(" (%+.1f%%)", trend[:percent]) : ""
+        "#{number(trend[:first])}#{units} → #{number(trend[:last])}#{units}, " \
+          "#{trend[:direction]}#{percent} across #{trend[:count]} draws " \
+          "(#{trend[:from]} → #{trend[:to]}); " \
+          "plotted over #{number(trend[:low])}–#{number(trend[:high])}#{units}"
+      end
+
+      # Lab values are decimals but not always: a white count of 7 should not
+      # print as 7.0 merely because the arithmetic went through a float.
+      def number(value)
+        (value % 1).zero? ? value.to_i.to_s : format("%g", value)
       end
 
       def print_table(results, history: nil)
@@ -229,12 +288,23 @@ module Health
           when "--until"     then opts[:until] = date!(argv.shift, arg)
           when "--panel"     then opts[:panel] = value!(argv.shift, arg).downcase
           when "--history"   then opts[:history] = value!(argv.shift, arg)
+          when "--trend"     then opts[:trend] = true
           when "--abnormal"  then opts[:abnormal] = true
           when "--vitals"    then opts[:vitals] = true
           when "--no-vitals" then opts[:vitals] = false
           else raise Args::BadArgument, "unknown labs option: #{arg}"
           end
         end
+
+        # Without --history the rows are one value each of many different
+        # analytes, and a sparkline across those would be a picture of nothing
+        # — sodium next to a white count next to a BMI. Refuse rather than draw
+        # it, because it would look like a real trend.
+        if opts[:trend] && opts[:history].nil?
+          raise Args::BadArgument, "--trend needs --history NAME — a trend is one analyte over time, " \
+                                   "and without it each row is a different analyte"
+        end
+
         opts
       end
 

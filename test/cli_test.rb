@@ -39,6 +39,7 @@ require "health/commands/labs"
 require "health/fhir"
 require "health/fhir/client"
 require "health/table"
+require "health/sparkline"
 require "health/commands/resource"
 require "health/commands/meds"
 require "health/commands/problems"
@@ -4229,3 +4230,160 @@ class RecordDispatchTest < Minitest::Test
     %w[meds problems allergies shots docs].each { |command| assert_includes out, command }
   end
 end
+# --------------------------------------------------------------- the sparkline
+
+class SparklineTest < Minitest::Test
+  # One block on its own would show a trend that was never measured.
+  def test_a_single_point_is_not_a_trend
+    assert_nil Health::Sparkline.render([1.0])
+    assert_nil Health::Sparkline.summarize([1.0])
+    assert_nil Health::Sparkline.render([nil, 1.0])
+  end
+
+  def test_the_series_is_scaled_to_its_own_extremes
+    assert_equal "▁█", Health::Sparkline.render([1, 2])
+    assert_equal "▁▅█", Health::Sparkline.render([0, 5, 10])
+  end
+
+  # All ▁ would read as "bottomed out" rather than "unchanged".
+  def test_a_flat_series_sits_in_the_middle_not_the_floor
+    assert_equal "▅▅▅", Health::Sparkline.render([7, 7, 7])
+  end
+
+  def test_summarize_reports_the_span_it_was_drawn_against
+    summary = Health::Sparkline.summarize([5.2, 5.3, 5.2])
+
+    assert_in_delta 5.2, summary[:first]
+    assert_in_delta 5.2, summary[:last]
+    assert_in_delta 5.2, summary[:low]
+    assert_in_delta 5.3, summary[:high]
+    assert_equal 3, summary[:count]
+    assert_equal "flat", summary[:direction]
+  end
+
+  def test_direction_and_percent
+    rising = Health::Sparkline.summarize([10.0, 15.0])
+    assert_equal "rising", rising[:direction]
+    assert_in_delta 50.0, rising[:percent]
+
+    falling = Health::Sparkline.summarize([45.9, 28.9])
+    assert_equal "falling", falling[:direction]
+    assert_operator falling[:percent], :<, 0
+  end
+
+  # A lab value can legitimately start at zero, and a percentage of zero is not
+  # a large change — it is an undefined one.
+  def test_a_series_starting_at_zero_has_no_percentage
+    assert_nil Health::Sparkline.summarize([0.0, 4.0])[:percent]
+  end
+end
+
+# --------------------------------------------------- health labs --trend
+
+# Separate from LabsCommandTest because every test here needs a series of its
+# own; the shared HISTORY fixture is one shape and the trend line is mostly
+# about the shapes it is *not*.
+class LabsTrendTest < Minitest::Test
+  include XDGSandbox
+
+  FakeRecord = LabsCommandTest::FakeRecord
+  Entry = Health::Portal::HistoryIndex::Entry
+  INDEX = [Entry.new(panel: "CBC (IQH)", analyte: "Hct", uuid: "u-hct")].freeze
+
+  def setup
+    super
+    write_config("client_id" => "x")
+  end
+
+  # Newest first, as the history endpoint serves it.
+  def history_of(values, units: "%")
+    items = values.reverse.each_with_index.map do |value, i|
+      { "name" => "Hct", "type" => "Hct",
+        "resultValues" => [{ "value" => value&.to_s, "units" => units }],
+        "referenceRanges" => { "normalLow" => { "value" => "42.0" }, "normalHigh" => { "value" => "53.0" } },
+        "performedDateTime" => "#{2026 - i}-01-15T15:00:00Z" }
+    end
+    { "items" => items }
+  end
+
+  # `values` oldest first, the direction a chart is read.
+  def run_trend(values, argv: ["--history", "Hct", "--trend"], units: "%", json: false, quiet: false)
+    record = FakeRecord.new(LabsCommandTest::PAYLOAD, history: history_of(values, units: units), index: INDEX)
+    global = Health::GlobalOptions.new(json: json, quiet: quiet, verbose: false)
+    io, err = StringIO.new, StringIO.new
+    cmd = Health::Commands::Labs.new(global, io: io, err: err, record_factory: ->(_c, _l) { record })
+    [cmd.run(argv), io.string, err.string]
+  end
+
+  def trend_line(out) = out.lines.find { |l| l.include?("→") }
+
+  def test_it_draws_the_series_and_says_what_it_is_drawn_against
+    code, out = run_trend([38.4, 44.1, 40.2])
+    line = trend_line(out)
+
+    assert_equal 0, code
+    assert_match(/\A[▁-█]{3}\s/, line)
+    assert_match(/38\.4 % → 40\.2 %, rising \(\+4\.7%\) across 3 draws/, line)
+    assert_match(/\(2024-01-15 → 2026-01-15\)/, line)
+    # Without this a tenth of a percent draws the same spike as a doubling.
+    assert_match(/plotted over 38\.4–44\.1 %/, line)
+  end
+
+  # "flat (+0.0%)" spends a clause saying the same thing twice.
+  def test_a_series_that_did_not_move_says_flat_once
+    _code, out = run_trend([5.0, 5.0])
+
+    assert_match(/5 % → 5 %, flat across 2 draws/, trend_line(out))
+    refute_match(/0\.0%/, trend_line(out))
+  end
+
+  # A white count of 7 should not print as 7.0 because the arithmetic went
+  # through a float, and an analyte with no units should not print a stray one.
+  def test_whole_numbers_and_missing_units_print_plainly
+    _code, out = run_trend([5.0, 7.0], units: nil)
+
+    assert_match(/5 → 7, rising \(\+40\.0%\) across 2 draws/, trend_line(out))
+    assert_match(/plotted over 5–7\z/, trend_line(out).strip)
+  end
+
+  def test_one_draw_is_not_a_trend
+    _code, _out, err = run_trend([40.2])
+    assert_match(/not enough numeric draws to plot a trend/, err)
+
+    _code, _out, err = run_trend([40.2], quiet: true)
+    assert_empty err
+  end
+
+  # --trend changes the JSON's shape, so it does so only when asked.
+  def test_json_moves_the_rows_under_results_beside_the_trend
+    _code, out = run_trend([38.4, 44.1, 40.2], json: true)
+    payload = JSON.parse(out)
+
+    assert_equal 3, payload["results"].size
+    assert_equal 3, payload["trend"]["count"]
+    assert_equal "%", payload["trend"]["units"]
+    assert_equal "2024-01-15", payload["trend"]["from"]
+    refute_empty payload["trend"]["sparkline"]
+
+    _code, out = run_trend([38.4, 44.1], argv: ["--history", "Hct"], json: true)
+    assert_kind_of Array, JSON.parse(out)
+  end
+
+  def test_json_reports_no_trend_rather_than_inventing_one
+    _code, out = run_trend([40.2], json: true)
+
+    assert_nil JSON.parse(out)["trend"]
+    assert_equal 1, JSON.parse(out)["results"].size
+  end
+
+  # A sparkline across the default listing would be sodium next to a white
+  # count next to a BMI — a picture of nothing that looks like a trend.
+  def test_trend_without_history_is_refused
+    error = assert_raises(Health::Commands::Args::BadArgument) do
+      run_trend([38.4, 44.1], argv: ["--trend"])
+    end
+
+    assert_match(/--trend needs --history NAME/, error.message)
+  end
+end
+

@@ -120,6 +120,7 @@ module Health
           --vitals       Only vitals (BP, pulse, weight, BMI)
           --no-vitals    Only labs
           --history NAME Every recorded draw of one analyte, newest first
+          --trend        Sparkline over --history, with the span it is drawn against
 
         Record flags (meds, problems, allergies, shots, docs):
           --since DATE   Only entries on or after DATE (YYYY-MM-DD)

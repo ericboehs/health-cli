@@ -3645,6 +3645,33 @@ class FHIRClientTest < Minitest::Test
 
     assert_match(/not the FHIR host/, error.message)
   end
+
+  # Same host, same port, one scheme down: the bearer token would go over the
+  # wire in the clear. Checked against the configured base rather than a
+  # hardcoded "https" so a local stub still works, which is what makes this
+  # worth asserting.
+  def test_a_payload_url_may_not_downgrade_the_scheme
+    cfg = config("fhir_host" => "https://fhir.example/r4", "tenant" => "t1")
+    client = Health::FHIR::Client.new(cfg, session: StubSession.new)
+
+    error = assert_raises(Health::FHIR::Error) { client.fetch_binary("http://fhir.example/r4/t1/Binary/1") }
+    assert_match(/not the FHIR host/, error.message)
+  end
+
+  # An access token lives 570 seconds and a full record walk can outlast that,
+  # so the token is asked for per request rather than captured once.
+  def test_every_request_asks_the_session_for_a_token
+    page2 = nil
+    routes = {
+      "GET /r4/t1/Condition" => ->(_r) { [200, bundle([], next_url: page2)] },
+      "GET /r4/t1/page2" => [200, bundle([])]
+    }
+    client = client_for(routes)
+    page2 = "#{@stub.base}/r4/t1/page2"
+    client.search("Condition")
+
+    assert_equal 2, @session.calls
+  end
 end
 
 # ------------------------------------------------------------------- the table
@@ -4358,6 +4385,52 @@ class RecordDispatchTest < Minitest::Test
     %w[meds problems allergies shots docs].each { |command| assert_includes out, command }
   end
 end
+
+# ----------------------------------------------------------- the executable
+
+# Every other test here loads `lib` directly, which means `bin/health` — the
+# only thing anyone actually runs — is the one file the suite never executes.
+# A require dropped from it would leave the whole suite green and every
+# command broken, so this runs the real script in a real subprocess.
+class ExecutableTest < Minitest::Test
+  include XDGSandbox
+
+  BIN = File.expand_path("../bin/health", __dir__)
+
+  def setup
+    super
+    write_config("client_id" => "x")
+    @env = ENV.to_h.slice("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")
+  end
+
+  def health(*argv)
+    out = IO.popen(@env, [RbConfig.ruby, BIN, *argv], err: [:child, :out], &:read)
+    [$?.exitstatus, out]
+  end
+
+  def test_the_script_boots_and_lists_its_commands
+    code, out = health("help")
+
+    assert_equal 0, code, out
+    assert_match(/Usage: health/, out)
+    %w[auth config labs meds problems allergies shots docs].each { |command| assert_includes out, command }
+  end
+
+  # A dispatch entry naming a class whose file is never required raises
+  # NameError at the moment someone reaches for that command, and only then.
+  # Without a grant these stop at the missing patient context, so nothing here
+  # touches the network.
+  def test_every_command_resolves_its_class
+    %w[meds problems allergies shots docs].each do |command|
+      code, out = health(command)
+
+      assert_equal 1, code, "#{command}: #{out}"
+      assert_match(/health auth login/, out, command)
+      refute_match(/NameError|uninitialized constant/, out, command)
+    end
+  end
+end
+
 # --------------------------------------------------------------- the sparkline
 
 class SparklineTest < Minitest::Test

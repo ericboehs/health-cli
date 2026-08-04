@@ -1186,6 +1186,24 @@ class CLITest < Minitest::Test
     assert_match(/could not reach the server/, err)
   end
 
+  # The rescue above this one catches the network Errno classes by name. A
+  # filesystem Errno is also a SystemCallError, and it used to be swallowed by
+  # that same clause and reported as "could not reach the server" — a sentence
+  # that sends someone to look at their wifi over a file in their home
+  # directory. Its own message names the path, which is the whole diagnosis.
+  def test_a_filesystem_error_is_reported_as_itself_not_as_a_network_failure
+    cache = Health::Config.cache_dir
+    FileUtils.remove_entry(cache)
+    File.write(cache, "not a directory")
+
+    code, _out, err = capture { Health::CLI.run(["auth", "status"]) }
+
+    assert_equal 1, code
+    assert_match(/File exists/, err)
+    assert_match(/cache/, err)
+    refute_match(/could not reach the server/, err)
+  end
+
   def test_config_init_then_show
     code, out, = capture { Health::CLI.run(["config", "init", "cid-123"]) }
     assert_equal 0, code

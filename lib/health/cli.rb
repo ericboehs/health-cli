@@ -11,10 +11,17 @@ module Health
 
   class CLI
     # Everything that can go wrong between this process and the provider.
-    # SystemCallError covers the Errno family (ECONNREFUSED, EHOSTUNREACH…) in
-    # one entry.
+    #
+    # The Errno family is listed one class at a time rather than caught as
+    # SystemCallError, which would also swallow ENOENT and EACCES: since
+    # `docs --get` writes a file, a bad --out path would otherwise be reported
+    # as "could not reach the server" and send the operator to debug a network
+    # that worked.
     NETWORK_ERRORS = [
-      SocketError, IOError, SystemCallError,
+      SocketError, IOError,
+      Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE,
+      Errno::EHOSTUNREACH, Errno::EHOSTDOWN, Errno::ENETUNREACH, Errno::ENETDOWN,
+      Errno::ETIMEDOUT, Errno::EADDRNOTAVAIL,
       Net::OpenTimeout, Net::ReadTimeout, Net::HTTPBadResponse, Net::ProtocolError,
       OpenSSL::SSL::SSLError, URI::Error
     ].freeze
@@ -56,6 +63,12 @@ module Health
     # person id — into whatever the operator pastes into a bug report.
     rescue *NETWORK_ERRORS => e
       warn "health: could not reach the server (#{e.class}: #{e.message})"
+      1
+    # Anything else from the operating system — a directory that isn't there,
+    # a file that can't be written. Its own message names the path, which is
+    # the whole diagnosis.
+    rescue SystemCallError => e
+      warn "health: #{e.message}"
       1
     rescue Interrupt
       warn "\nhealth: interrupted"

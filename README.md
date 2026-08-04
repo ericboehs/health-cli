@@ -156,7 +156,10 @@ nothing:
   resolved or refuted entry still says what was once suspected.
 
 `docs` is the only command that writes a file, and only when given `--get`. It
-refuses to overwrite. Some documents are listed but not released for download —
+refuses to overwrite, and writes mode `0600` — a downloaded visit summary is a
+medical record, not something to leave world-readable because the directory's
+umask said so. With `--json` it reports the path and byte count as a document a
+script can act on. Some documents are listed but not released for download —
 intake forms 404 while the visit summary from the same encounter succeeds — so
 that 404 gets its own message rather than reading as a broken id.
 

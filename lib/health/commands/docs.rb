@@ -86,8 +86,20 @@ module Health
         path = destination(opts, item, content_type)
         write!(path, body)
 
-        @err.puts "Saved #{item[:title]} (#{body.bytesize} bytes) to #{path}" unless @global.quiet
+        report(item, path, content_type, body)
         0
+      end
+
+      # Where it went, in the shape the caller asked for. `--json` here is a
+      # path a script can act on; the human form is stderr like every other
+      # count, so `health docs --get X --json > note.json` is still only JSON.
+      def report(item, path, content_type, body)
+        if @global.json
+          @io.puts JSON.pretty_generate(id: item[:id], title: item[:title], path: path,
+            content_type: content_type, bytes: body.bytesize)
+        elsif !@global.quiet
+          @err.puts "Saved #{item[:title]} (#{body.bytesize} bytes) to #{path}"
+        end
       end
 
       def destination(opts, item, content_type)

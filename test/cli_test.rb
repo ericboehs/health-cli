@@ -4176,9 +4176,9 @@ class DocsCommandTest < Minitest::Test
     }.merge(overrides)
   end
 
-  def run_docs(argv, resources: [document], binary: ["application/pdf", "%PDF-1.4"], quiet: false)
+  def run_docs(argv, resources: [document], binary: ["application/pdf", "%PDF-1.4"], quiet: false, json: false)
     @client = FakeClient.new(resources, binary: binary)
-    global = Health::GlobalOptions.new(json: false, quiet: quiet, verbose: false)
+    global = Health::GlobalOptions.new(json: json, quiet: quiet, verbose: false)
     io, err = StringIO.new, StringIO.new
     cmd = Health::Commands::Docs.new(global, io: io, err: err, client_factory: ->(_c, _l) { @client })
     [cmd.run(argv), io.string, err.string]
@@ -4241,6 +4241,21 @@ class DocsCommandTest < Minitest::Test
     # A medical record has no business being world-readable merely because it
     # landed in a directory whose umask says so.
     assert_equal "600", format("%o", File.stat(path).mode & 0o777)
+  end
+
+  # `health docs --get X --json > note.json` is still only JSON: the human
+  # sentence is stderr like every other count in this tool.
+  def test_get_reports_where_it_landed_as_json_when_asked
+    code, out, err = run_docs(["--get", "d1"], json: true)
+    report = JSON.parse(out)
+
+    assert_equal 0, code
+    assert_empty err
+    assert_equal "d1", report["id"]
+    assert_equal "General Exam *", report["title"]
+    assert_equal "application/pdf", report["content_type"]
+    assert_equal 8, report["bytes"]
+    assert_equal File.join(File.realpath(@tmp), "general-exam-2026-05-01.pdf"), report["path"]
   end
 
   def test_get_honours_out_and_stays_silent_under_quiet
@@ -4308,13 +4323,9 @@ class DocsCommandTest < Minitest::Test
 
   # `status` falls back when Millennium omits docStatus.
   def test_the_status_falls_back_to_the_reference_status
-    global = Health::GlobalOptions.new(json: true, quiet: false, verbose: false)
-    io = StringIO.new
-    client = FakeClient.new([document("docStatus" => nil)])
-    cmd = Health::Commands::Docs.new(global, io: io, err: StringIO.new, client_factory: ->(_c, _l) { client })
-    cmd.run([])
+    _code, out = run_docs([], resources: [document("docStatus" => nil)], json: true)
 
-    assert_equal "current", JSON.parse(io.string).first["status"]
+    assert_equal "current", JSON.parse(out).first["status"]
   end
 end
 

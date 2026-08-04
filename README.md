@@ -4,8 +4,11 @@ A headless CLI for my own medical records, against Oracle Health (Cerner) — SM
 on FHIR where that works, the patient portal where it doesn't. Pure Ruby stdlib
 — no gems at runtime.
 
-**Status: labs work.** `health labs` returns real values with real reference
-ranges. It does not use FHIR to do it — see *Two backends*, below.
+**Status: the record reads.** `health labs` returns real values with real
+reference ranges — it does not use FHIR to do it, see *Two backends*, below.
+Everything else (`meds`, `problems`, `allergies`, `shots`, `docs`) comes from
+FHIR, where those resources are fully populated even though the lab values
+aren't.
 
 ```
 $ health labs --no-vitals
@@ -107,6 +110,15 @@ health labs --no-vitals            # labs only; --vitals for the other half
 health labs --panel cbc            # one panel
 health labs --since 2026-01-15 --until 2026-01-15   # one draw
 health labs --history Hct          # every recorded draw of one analyte
+health labs --history Hct --trend  # …with a sparkline and the span it's drawn against
+
+health meds                        # active prescriptions; --all for the rest
+health problems                    # the problem list; --all adds encounter diagnoses
+health allergies                   # never filtered — see below
+health shots                       # immunizations, with the CVX product name
+health docs                        # clinical notes and visit summaries
+health docs --get 197093525        # download one (ids come from `health docs`)
+health docs --get 197093525 --out visit.pdf
 
 health auth login          # browser sign-in, standalone patient launch
 health auth status         # is there a usable token? (never prints one)
@@ -118,19 +130,47 @@ health config edit
 ```
 
 `--json` on any command swaps formatted output for JSON. `--tenant <name>`
-overrides the tenant for a single `auth` invocation.
+overrides the tenant for a single `auth` invocation. `--since` and `--until`
+work on every record command, not just `labs`.
 
 Counts and sign-in chatter go to stderr, so `health labs --json | jq` gets
 nothing but JSON.
 
+### What the record commands decide for you
+
+Three of these have a default that hides rows, and each says how many:
+
+- **`meds`** shows active, on-hold and draft prescriptions, and prints the
+  count of what it left out. Its Refills column is what the prescriber
+  *authorized*, never what remains — `MedicationDispense` is empty on this
+  record, because a prescription filled at a retail pharmacy leaves no dispense
+  event in Millennium, so the pharmacy is the only place that knows.
+- **`problems`** shows the standing problem list. Condition carries encounter
+  diagnoses under the same resource type — 106 of them against 30 problems on
+  this record — and printing all 136 as "your problems" would be wrong in the
+  direction that alarms people.
+- **`allergies`** filters nothing, deliberately. The list is short, and it is
+  the one list where an omission is dangerous rather than merely untidy; a
+  resolved or refuted entry still says what was once suspected.
+
+`docs` is the only command that writes a file, and only when given `--get`. It
+refuses to overwrite. Some documents are listed but not released for download —
+intake forms 404 while the visit summary from the same encounter succeeds — so
+that 404 gets its own message rather than reading as a broken id.
+
 ## Two backends
 
-`auth` talks to Millennium over FHIR. `labs` does not, because **the FHIR
-endpoint has no lab values in it**: `Observation?category=laboratory` returns a
-full page of resources with zero `valueQuantity` and zero `referenceRange` —
-codes and dates and nothing else. Broadening the app registration to all 37 patient scopes
-changed the response by zero bytes, so this is a data problem, not an
-authorization one.
+`auth` and the five record commands talk to Millennium over FHIR. `labs` does
+not, because **the FHIR endpoint has no lab values in it**:
+`Observation?category=laboratory` returns a full page of resources with zero
+`valueQuantity` and zero `referenceRange` — codes and dates and nothing else.
+Broadening the app registration to all 37 patient scopes changed the response by
+zero bytes, so this is a data problem, not an authorization one.
+
+The gap is specific to Observation. `MedicationRequest`, `Condition`,
+`AllergyIntolerance`, `Immunization` and `DocumentReference` all come back
+complete over the same grant, which is why those five commands are FHIR and
+`labs` alone is not.
 
 The values live in HealtheIntent, the platform behind the patient portal, and
 the portal serves them as JSON to anyone who asks for `Accept:
@@ -293,8 +333,11 @@ the one method that would open a browser. The portal login is tested the same
 way: a loopback server serves the SAML and Django pages, so the redirect chain,
 the cookie-domain rules and the session cache are all exercised for real.
 
-100% line coverage is enforced; the two genuinely untestable branches (launching
-Safari, a browser resetting the connection mid-write) are marked `:nocov:`.
+100% line *and* branch coverage is enforced; the two genuinely untestable
+branches (launching Safari, a browser resetting the connection mid-write) are
+marked `:nocov:`. The FHIR commands are tested against a fake client rather than
+the loopback server — the client itself is what the loopback server is for, and
+the commands are worth testing against payload shapes, not HTTP.
 
 One trap worth knowing about: any test that builds a real record factory has to
 take `op` off `PATH` first. With a live 1Password session available it will

@@ -3449,7 +3449,8 @@ class FHIRClientTest < Minitest::Test
   end
 
   def test_a_link_entry_that_is_not_a_hash_is_ignored
-    body = JSON.generate("link" => ["junk"], "entry" => [{ "resource" => { "id" => "1" } }])
+    body = JSON.generate("resourceType" => "Bundle", "link" => ["junk"],
+                         "entry" => [{ "resource" => { "id" => "1" } }])
     client = client_for({ "GET /r4/t1/Condition" => [200, body] })
 
     assert_equal 1, client.search("Condition").size
@@ -3479,7 +3480,8 @@ class FHIRClientTest < Minitest::Test
   end
 
   def test_entries_without_a_resource_are_skipped
-    body = JSON.generate("entry" => ["junk", { "no" => "resource" }, { "resource" => { "id" => "1" } }])
+    body = JSON.generate("resourceType" => "Bundle",
+                         "entry" => ["junk", { "no" => "resource" }, { "resource" => { "id" => "1" } }])
     client = client_for({ "GET /r4/t1/Condition" => [200, body] })
 
     assert_equal ["1"], client.search("Condition").map { |r| r["id"] }
@@ -3510,16 +3512,33 @@ class FHIRClientTest < Minitest::Test
       assert_raises(Health::FHIR::Error) { none.search("Condition") }.message
   end
 
-  # A token endpoint answering with a non-object used to raise NoMethodError,
-  # which is not a Health::Error and escaped the top-level rescue.
-  def test_a_body_that_is_not_a_json_object_is_treated_as_empty
+  # A failure body that isn't JSON at all used to raise NoMethodError, which is
+  # not a Health::Error and escaped the top-level rescue.
+  def test_a_failure_body_that_is_not_json_still_reports_the_status
     client = client_for({ "GET /r4/t1/Condition" => [500, "not json at all"] })
+
     assert_equal "Condition request failed (HTTP 500)",
       assert_raises(Health::FHIR::Error) { client.search("Condition") }.message
+  end
+
+  # The status code is not the answer — the body has to be a Bundle. A proxy
+  # interstitial or a 200 OperationOutcome would otherwise print as "no
+  # medications matched", which is word for word what a record with no
+  # prescriptions prints, and exits 0 either way.
+  def test_a_200_that_is_not_a_bundle_is_refused_rather_than_read_as_empty
+    client = client_for({ "GET /r4/t1/Condition" => [200, "<html>Sign in</html>"] })
+    error = assert_raises(Health::FHIR::Error) { client.search("Condition") }
+    assert_match(/not FHIR JSON rather than a Bundle/, error.message)
+    assert_match(/refusing to read it as an empty record/, error.message)
+
+    @stub.stop
+    outcome = client_for({ "GET /r4/t1/Condition" => [200, JSON.generate("resourceType" => "OperationOutcome")] })
+    assert_match(/answered with a OperationOutcome/,
+      assert_raises(Health::FHIR::Error) { outcome.search("Condition") }.message)
 
     @stub.stop
     array = client_for({ "GET /r4/t1/Condition" => [200, "[]"] })
-    assert_empty array.search("Condition")
+    assert_raises(Health::FHIR::Error) { array.search("Condition") }
   end
 
   def test_progress_goes_to_the_log_without_the_url

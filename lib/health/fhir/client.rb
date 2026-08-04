@@ -121,7 +121,25 @@ module Health
           raise Error, "#{resource} request failed (HTTP #{res.code})#{detail_of(body)}"
         end
 
-        body
+        bundle!(body, resource)
+      end
+
+      # A 200 is not on its own an answer. A proxy interstitial, a login page,
+      # or an OperationOutcome served with a 200 all parse to something this
+      # code can call `["entry"]` on and get nothing from — and "nothing" then
+      # prints as `no medications matched`, which is byte-identical to the
+      # true statement that there are no prescriptions. Between "the record is
+      # empty" and "the answer wasn't a record", only the second is safe to
+      # get wrong in the direction of silence.
+      def bundle!(body, resource)
+        # `parse` hands back a Hash or nothing, so an interstitial, a bare
+        # array and unparseable bytes all arrive here as {} — no resourceType,
+        # which is the "not FHIR JSON" case.
+        kind = body["resourceType"]
+        return body if kind == "Bundle"
+
+        raise Error, "#{resource} search answered with #{kind ? "a #{kind}" : "something that is not FHIR JSON"} " \
+                     "rather than a Bundle — refusing to read it as an empty record"
       end
 
       def get(uri, accept:)

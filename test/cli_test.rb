@@ -38,6 +38,7 @@ require "health/portal/history_index"
 require "health/commands/labs"
 require "health/fhir"
 require "health/fhir/client"
+require "health/progress"
 require "health/table"
 require "health/sparkline"
 require "health/commands/resource"
@@ -3404,11 +3405,11 @@ class FHIRClientTest < Minitest::Test
                   "entry" => resources.map { |r| { "resource" => r } })
   end
 
-  def client_for(routes, tokens: { "patient" => "PT1" }, io: nil)
+  def client_for(routes, tokens: { "patient" => "PT1" }, progress: Health::Progress.null)
     @stub = StubHTTP.new(routes)
     @session = StubSession.new(tokens)
     cfg = config("fhir_host" => "#{@stub.base}/r4", "tenant" => "t1")
-    Health::FHIR::Client.new(cfg, session: @session, io: io)
+    Health::FHIR::Client.new(cfg, session: @session, progress: progress)
   end
 
   def query_of(request) = URI.decode_www_form(URI("http://x#{request.path}").query.to_s).to_h
@@ -3570,14 +3571,32 @@ class FHIRClientTest < Minitest::Test
     refute_match(/PT1/, message)
   end
 
-  def test_progress_goes_to_the_log_without_the_url
-    io = StringIO.new
-    client = client_for({ "GET /r4/t1/Condition" => [200, bundle([])] }, io: io)
+  def test_progress_says_which_page_without_saying_the_url
+    err = StringIO.new
+    client = client_for({ "GET /r4/t1/Condition" => [200, bundle([])] },
+      progress: Health::Progress::Lines.new(err))
     client.search("Condition")
 
-    assert_match(/Condition: fetching page 1/, io.string)
+    assert_match(/Condition: fetching page 1/, err.string)
     # The query string carries the person id.
-    refute_match(/PT1/, io.string)
+    refute_match(/PT1/, err.string)
+  end
+
+  # A second page is where the waiting is felt, so it is where the count of
+  # what has already arrived is worth saying.
+  def test_progress_counts_what_has_arrived_before_asking_for_more
+    err = StringIO.new
+    page2 = nil
+    routes = {
+      "GET /r4/t1/MedicationRequest" => ->(_r) { [200, bundle([{ "id" => "1" }], next_url: page2)] },
+      "GET /r4/t1/page2" => [200, bundle([{ "id" => "2" }])]
+    }
+    client = client_for(routes, progress: Health::Progress::Lines.new(err))
+    page2 = "#{@stub.base}/r4/t1/page2"
+    client.search("MedicationRequest")
+
+    assert_match(/fetching page 1$/, err.string.lines.first.chomp)
+    assert_match(/fetching page 2 \(1 so far\)/, err.string)
   end
 
   # --------------------------------------------------------------- attachments
@@ -3674,6 +3693,108 @@ class FHIRClientTest < Minitest::Test
   end
 end
 
+# ---------------------------------------------------------------- progress
+
+class ProgressTest < Minitest::Test
+  # A stand-in terminal. Not a StringIO, because the spinner writes from its
+  # own thread while the test reads, and StringIO does not promise to survive
+  # that; this collects writes under a lock. StringIO stays the stand-in for
+  # the pipe, where the answer to `tty?` is the whole point.
+  class FakeTTY
+    def initialize
+      @lock = Mutex.new
+      @writes = []
+    end
+
+    def tty? = true
+
+    def print(text) = @lock.synchronize { @writes << text }
+
+    def string = @lock.synchronize { @writes.join }
+  end
+
+  ERASE = "\r\e[K".freeze
+
+  def test_the_reporter_is_chosen_from_the_stream_and_the_flags
+    assert_instance_of Health::Progress::Null, Health::Progress.for(FakeTTY.new, quiet: true, verbose: true)
+    assert_instance_of Health::Progress::Lines, Health::Progress.for(FakeTTY.new, verbose: true)
+    assert_instance_of Health::Progress::Spinner, Health::Progress.for(FakeTTY.new)
+    # A pipe or a file: the case that must keep behaving as it did before any
+    # of this existed.
+    assert_instance_of Health::Progress::Null, Health::Progress.for(StringIO.new)
+  end
+
+  def test_the_null_reporter_says_nothing
+    null = Health::Progress.null
+
+    assert_nil null.say("fetching page 1")
+    assert_nil null.finish
+  end
+
+  def test_lines_are_prefixed_and_kept
+    err = StringIO.new
+    lines = Health::Progress::Lines.new(err)
+    lines.say("one")
+    lines.say("two")
+
+    assert_nil lines.finish
+    assert_equal ["health: one\n", "health: two\n"], err.string.lines
+  end
+
+  def test_the_spinner_redraws_one_line_with_the_time_it_has_waited
+    err = FakeTTY.new
+    seconds = [0, 3]
+    # A minute of interval so the ticker cannot get a second frame in: this
+    # test is about what one draw looks like.
+    spinner = Health::Progress::Spinner.new(err, interval: 60, clock: -> { seconds.shift })
+    spinner.say("MedicationRequest: fetching page 1")
+    spinner.finish
+
+    assert_equal "#{ERASE}⠙ MedicationRequest: fetching page 1 · 3s#{ERASE}", err.string
+  end
+
+  # The wait being described is a blocking socket read, so the clock has to
+  # advance without the main thread's help.
+  def test_the_spinner_keeps_ticking_while_the_caller_waits
+    err = FakeTTY.new
+    spinner = Health::Progress::Spinner.new(err, interval: 0.005)
+    spinner.say("fetching")
+
+    deadline = Time.now + 5
+    sleep 0.005 while err.string.scan(ERASE).size < 3 && Time.now < deadline
+    spinner.finish
+    frames = err.string.scan(/#{Regexp.escape(ERASE)}(\S) /).flatten
+
+    assert_operator frames.size, :>=, 3
+    refute_equal frames.first, frames.last, "the spinner drew the same frame every time"
+  end
+
+  def test_finishing_stops_the_drawing
+    err = FakeTTY.new
+    spinner = Health::Progress::Spinner.new(err, interval: 0.005)
+    spinner.say("fetching")
+    spinner.finish
+    settled = err.string
+    sleep 0.05
+
+    assert_equal settled, err.string
+    assert settled.end_with?(ERASE), "the spinner left its last frame on the line"
+  end
+
+  # A frame that lands after the line was erased is the one thing that would
+  # leave a terminal dirty, and it is a race — the ticker blocked on the lock
+  # `finish` is holding. It cannot be scheduled on purpose, so the drawing is
+  # driven directly instead.
+  def test_a_frame_that_arrives_after_the_end_is_dropped
+    err = FakeTTY.new
+    spinner = Health::Progress::Spinner.new(err, interval: 0.005)
+    spinner.finish
+    spinner.send(:draw)
+
+    assert_empty err.string
+  end
+end
+
 # ------------------------------------------------------------------- the table
 
 class TableTest < Minitest::Test
@@ -3764,7 +3885,7 @@ class RecordCommandTest < Minitest::Test
     global = Health::GlobalOptions.new(json: json, quiet: quiet, verbose: verbose)
     io, err = StringIO.new, StringIO.new
     cmd = klass.new(global, io: io, err: err,
-      client_factory: ->(_config, log) { @log = log; @client })
+      client_factory: ->(_config, progress) { @progress = progress; @client })
     [cmd.run(argv), io.string, err.string]
   end
 
@@ -3796,20 +3917,21 @@ class RecordCommandTest < Minitest::Test
     cmd = Health::Commands::Meds.new(Health::GlobalOptions.new(json: false, quiet: false, verbose: false))
     factory = cmd.instance_variable_get(:@client_factory)
 
-    assert_instance_of Health::FHIR::Client, factory.call(config, nil)
+    assert_instance_of Health::FHIR::Client, factory.call(config, Health::Progress.null)
   end
 
-  # Progress is stderr under --verbose and nowhere under --quiet, so a piped
-  # --json stays clean either way.
-  def test_verbose_logs_go_to_stderr_and_quiet_wins
+  # Progress is lines under --verbose and nothing under --quiet. The third case
+  # is the one that matters for a piped --json: stderr is a StringIO here, as it
+  # is a file or a pipe there, so nothing redraws.
+  def test_verbose_says_it_in_lines_and_quiet_wins
     run_cmd(Health::Commands::Meds, [], resources: [med], verbose: true)
-    refute_nil @log
+    assert_instance_of Health::Progress::Lines, @progress
 
     run_cmd(Health::Commands::Meds, [], resources: [med], verbose: true, quiet: true)
-    assert_nil @log
+    assert_instance_of Health::Progress::Null, @progress
 
     run_cmd(Health::Commands::Meds, [], resources: [med])
-    assert_nil @log
+    assert_instance_of Health::Progress::Null, @progress
   end
 
   def test_a_date_window_filters_and_keeps_undated_rows
@@ -4207,7 +4329,7 @@ class DocsCommandTest < Minitest::Test
     @client = FakeClient.new(resources, binary: binary)
     global = Health::GlobalOptions.new(json: json, quiet: quiet, verbose: false)
     io, err = StringIO.new, StringIO.new
-    cmd = Health::Commands::Docs.new(global, io: io, err: err, client_factory: ->(_c, _l) { @client })
+    cmd = Health::Commands::Docs.new(global, io: io, err: err, client_factory: ->(_c, _p) { @client })
     [cmd.run(argv), io.string, err.string]
   end
 

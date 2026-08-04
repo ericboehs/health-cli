@@ -37,7 +37,7 @@ module Health
 
       def run(argv)
         opts = parse!(argv.dup)
-        opts[:get] ? download(opts) : execute(opts)
+        with_progress { opts[:get] ? download(opts) : execute(opts) }
       end
 
       def extract(resource)
@@ -82,7 +82,13 @@ module Health
         raise Args::BadArgument, "no document with id #{wanted.inspect} — run `health docs` for the list" if item.nil?
         raise Health::Error, "document #{wanted} has no downloadable attachment" if item[:url].nil?
 
+        # Named by id rather than title: the title is off the record and this
+        # line is on a terminal that may not be the operator's alone.
+        progress.say("downloading document #{wanted}")
         content_type, body = client.fetch_binary(item[:url], accept: item[:content_type])
+        # Off before `report` prints, so the "Saved …" line is not written into
+        # a line the ticker is still redrawing.
+        progress.finish
         path = destination(opts, item, content_type)
         write!(path, body)
 

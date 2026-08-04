@@ -45,12 +45,27 @@ module Health
         @io = io
         @err = err
         @client_factory = client_factory ||
-          ->(config, log) { FHIR::Client.new(config, io: log) }
+          ->(config, progress) { FHIR::Client.new(config, progress: progress) }
       end
 
-      def run(argv) = execute(parse!(argv.dup))
+      def run(argv) = with_progress { execute(parse!(argv.dup)) }
 
       private
+
+      # Every path out of here — a table, a JSON document, a raised error, a
+      # Ctrl-C — has to leave the terminal as it found it, so the reporter is
+      # closed in an `ensure` rather than after the work.
+      def with_progress
+        yield
+      ensure
+        progress.finish
+      end
+
+      # Progress is stderr, so a piped `--json` stays clean; suppressed entirely
+      # under --quiet, and line-by-line rather than redrawn under --verbose.
+      def progress
+        @progress ||= Progress.for(@err, quiet: @global.quiet, verbose: @global.verbose)
+      end
 
       # Split from `run` so a subclass that takes over the argv (`docs --get`)
       # parses once and hands the same options back here.
@@ -66,16 +81,16 @@ module Health
       attr_reader :opts
 
       def client
-        # Progress and sign-in chatter are stderr, so a piped `--json` stays
-        # clean, and are suppressed entirely under --quiet.
-        @client ||= @client_factory.call(Health::Config.load, verbose_log)
+        @client ||= @client_factory.call(Health::Config.load, progress)
       end
-
-      def verbose_log = (@global.verbose && !@global.quiet) ? @err : nil
 
       def collect(opts)
         @opts = opts
         items = client.search(resource_type).map { |r| extract(r) }
+        # The waiting is over here, and the table is about to be printed to
+        # stdout — which would otherwise land on the line the ticker is still
+        # redrawing on stderr.
+        progress.finish
         items = filter(items, opts)
         items.sort_by { |i| sort_key(i) }.reverse
       end

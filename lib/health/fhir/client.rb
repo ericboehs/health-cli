@@ -31,11 +31,15 @@ module Health
       # fewer chances for one to fail partway through a walk.
       PAGE_SIZE = 100
 
-      def initialize(config, session: nil, tenant: nil, io: nil)
+      # `progress` is told what this is waiting on; see Health::Progress for who
+      # ends up listening. The session is left to its own stream, because the
+      # only thing it says is the browser instruction during `auth login`, which
+      # is not a read-path concern and must not be a redrawn line.
+      def initialize(config, session: nil, tenant: nil, progress: Progress.null)
         @config = config
         @tenant = tenant
-        @session = session || Session.new(config, tenant: tenant, io: io)
-        @io = io
+        @session = session || Session.new(config, tenant: tenant)
+        @progress = progress
       end
 
       # The patient this grant is scoped to. SMART returns it as launch context
@@ -63,7 +67,14 @@ module Health
 
         resources = []
         MAX_PAGES.times do |page|
-          log "#{resource}: fetching page #{page + 1}"
+          # Never the URL — a search URL carries the person id in its query
+          # string, and this is the one place in the read path that writes to a
+          # terminal the operator may well be piping into a file.
+          #
+          # The running total is what makes a second page bearable to wait
+          # through: it says the first one worked and roughly how much is left.
+          @progress.say("#{resource}: fetching page #{page + 1}" \
+                        "#{" (#{resources.size} so far)" unless resources.empty?}")
           bundle = get_json(uri, resource)
           resources.concat(entries_of(bundle))
 
@@ -227,12 +238,6 @@ module Health
       rescue JSON::ParserError
         {}
       end
-
-      # Progress goes to whatever stream the command passed, and never carries
-      # the URL: a search URL has the person id in its query string, and this
-      # is the one place in the read path that writes to a terminal the operator
-      # may well be piping into a file.
-      def log(message) = @io&.puts("health: #{message}")
     end
   end
 end

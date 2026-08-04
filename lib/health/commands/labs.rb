@@ -165,14 +165,26 @@ module Health
       # Oldest first, which is the direction a chart is read — the table above
       # is newest first because that is the direction a result is read.
       def trend_of(results)
-        series = results.reverse
+        # Every field below comes off this one series — the draws that are
+        # actually plotted. Taking `from`/`to` off the unfiltered list instead
+        # would date the picture by draws it doesn't contain: a result with two
+        # values has no comparable number (see Result#number), so a 16-month
+        # trend could be labelled a 6-year one, which is precisely the
+        # misreading the printed span exists to prevent.
+        series = results.reverse.select(&:number)
         numbers = series.map(&:number)
         summary = Sparkline.summarize(numbers)
         return nil if summary.nil?
 
+        units = series.map { |r| r.units.to_s }.reject(&:empty?).uniq
         summary.merge(
           sparkline: Sparkline.render(numbers),
-          units: series.map(&:units).compact.reject(&:empty?).last,
+          # A series that changed units mid-way is not one series. Labelling
+          # all of it with the newest unit would silently restate old values in
+          # a scale they were never measured in, so the label is dropped and
+          # the change is said out loud instead.
+          units: (units.size == 1) ? units.first : nil,
+          units_changed: (units.size > 1) ? units : nil,
           # Safe without a nil guard: `summarize` returned non-nil, which takes
           # two numbers, which takes at least two results.
           from: series.first.collected_on,
@@ -204,7 +216,14 @@ module Health
         "#{number(trend[:first])}#{units} → #{number(trend[:last])}#{units}, " \
           "#{trend[:direction]}#{percent} across #{trend[:count]} draws " \
           "(#{trend[:from]} → #{trend[:to]}); " \
-          "plotted over #{number(trend[:low])}–#{number(trend[:high])}#{units}"
+          "plotted over #{number(trend[:low])}–#{number(trend[:high])}#{units}" \
+          "#{units_warning(trend)}"
+      end
+
+      def units_warning(trend)
+        return "" if trend[:units_changed].nil?
+
+        " — units changed mid-series (#{trend[:units_changed].join(", ")}), so these are not one scale"
       end
 
       # Lab values are decimals but not always: a white count of 7 should not

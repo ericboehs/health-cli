@@ -4423,11 +4423,13 @@ class LabsTrendTest < Minitest::Test
     write_config("client_id" => "x")
   end
 
-  # Newest first, as the history endpoint serves it.
+  # Newest first, as the history endpoint serves it. `units` may be one string
+  # or one per value, oldest first alongside `values`.
   def history_of(values, units: "%")
-    items = values.reverse.each_with_index.map do |value, i|
+    units = Array.new(values.size, units) unless units.is_a?(Array)
+    items = values.zip(units).reverse.each_with_index.map do |(value, unit), i|
       { "name" => "Hct", "type" => "Hct",
-        "resultValues" => [{ "value" => value&.to_s, "units" => units }],
+        "resultValues" => [{ "value" => value&.to_s, "units" => unit }],
         "referenceRanges" => { "normalLow" => { "value" => "42.0" }, "normalHigh" => { "value" => "53.0" } },
         "performedDateTime" => "#{2026 - i}-01-15T15:00:00Z" }
     end
@@ -4502,6 +4504,53 @@ class LabsTrendTest < Minitest::Test
 
     assert_nil JSON.parse(out)["trend"]
     assert_equal 1, JSON.parse(out)["results"].size
+  end
+
+  # A series that changed units mid-way is not one series. Labelling all of it
+  # with the newest unit would restate the old values in a scale they were
+  # never measured in, so the label is dropped and the change is said out loud.
+  def test_a_series_that_changed_units_is_not_labelled_with_one
+    _code, out = run_trend([5.0, 7.0], units: ["g/dL", "mmol/L"])
+    line = trend_line(out)
+
+    assert_match(/5 → 7, rising/, line)
+    refute_match(%r{5 g/dL}, line)
+    assert_match(%r{units changed mid-series \(g/dL, mmol/L\), so these are not one scale}, line)
+  end
+
+  def test_json_says_which_units_the_series_changed_between
+    _code, out = run_trend([5.0, 7.0], units: ["g/dL", "mmol/L"], json: true)
+    trend = JSON.parse(out)["trend"]
+
+    assert_nil trend["units"]
+    assert_equal ["g/dL", "mmol/L"], trend["units_changed"]
+
+    # One unit throughout is the ordinary case and says nothing extra.
+    _code, out = run_trend([5.0, 7.0], json: true)
+    assert_nil JSON.parse(out)["trend"]["units_changed"]
+  end
+
+  # A result with two values has no comparable number, so it is not plotted —
+  # and dating the picture by a draw it doesn't contain would label a 1-year
+  # trend as a 3-year one, which is the misreading the span exists to prevent.
+  def test_the_span_is_dated_by_the_draws_that_were_actually_plotted
+    record = FakeRecord.new(LabsCommandTest::PAYLOAD, index: INDEX, history: { "items" => [
+      { "name" => "Hct", "type" => "Hct", "resultValues" => [{ "value" => "44.1", "units" => "%" }],
+        "performedDateTime" => "2026-01-15T15:00:00Z" },
+      { "name" => "Hct", "type" => "Hct", "resultValues" => [{ "value" => "38.4", "units" => "%" }],
+        "performedDateTime" => "2025-01-15T15:00:00Z" },
+      { "name" => "Hct", "type" => "Hct", "performedDateTime" => "2023-01-15T15:00:00Z",
+        "resultValues" => [{ "value" => "120", "units" => "mmHg" }, { "value" => "80", "units" => "mmHg" }] }
+    ] })
+    global = Health::GlobalOptions.new(json: false, quiet: false, verbose: false)
+    io = StringIO.new
+    cmd = Health::Commands::Labs.new(global, io: io, err: StringIO.new, record_factory: ->(_c, _l) { record })
+    cmd.run(["--history", "Hct", "--trend"])
+    line = trend_line(io.string)
+
+    assert_match(/across 2 draws/, line)
+    assert_match(/\(2025-01-15 → 2026-01-15\)/, line)
+    refute_match(/2023-01-15/, line)
   end
 
   # A sparkline across the default listing would be sodium next to a white

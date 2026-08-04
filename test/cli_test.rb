@@ -3626,6 +3626,19 @@ class FHIRClientTest < Minitest::Test
     assert_match(/could not download the document \(HTTP 403\)/, error.message)
   end
 
+  # A zero-byte 200 written out would be reported as a saved document, and
+  # `write!` then refuses to overwrite it — so the retry that would have
+  # worked is the one thing that can't happen.
+  def test_an_empty_two_hundred_is_not_a_document
+    client = client_for({ "GET /r4/t1/Binary/XR-1" => [200, "", { "Content-Type" => "application/pdf" }] })
+    error = assert_raises(Health::FHIR::Error) do
+      client.fetch_binary("#{@stub.base}/r4/t1/Binary/XR-1", accept: "application/pdf")
+    end
+
+    assert_match(/empty document \(HTTP 200, zero bytes\)/, error.message)
+    assert_match(/nothing was written/, error.message)
+  end
+
   def test_an_attachment_url_off_the_fhir_host_is_refused
     client = client_for({})
     error = assert_raises(Health::FHIR::Error) { client.fetch_binary("https://evil.example/x") }
@@ -4225,6 +4238,9 @@ class DocsCommandTest < Minitest::Test
     assert_equal 0, code
     assert_equal "%PDF-1.4", File.binread(path)
     assert_match(/Saved General Exam \* \(8 bytes\) to #{Regexp.escape(path)}/, err)
+    # A medical record has no business being world-readable merely because it
+    # landed in a directory whose umask says so.
+    assert_equal "600", format("%o", File.stat(path).mode & 0o777)
   end
 
   def test_get_honours_out_and_stays_silent_under_quiet

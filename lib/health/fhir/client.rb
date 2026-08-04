@@ -103,6 +103,12 @@ module Health
         unless res.is_a?(Net::HTTPSuccess)
           raise Error, "could not download the document (HTTP #{res.code})"
         end
+        # An empty 200 would otherwise be written out as a zero-byte file and
+        # reported as a success — and `write!` then refuses to overwrite it, so
+        # the retry that would have worked is the one thing that can't happen.
+        if res.body.to_s.empty?
+          raise Error, "the server returned an empty document (HTTP 200, zero bytes) — nothing was written"
+        end
 
         [res["content-type"].to_s.split(";").first.to_s.strip, res.body]
       end

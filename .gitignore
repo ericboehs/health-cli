@@ -1,5 +1,16 @@
 /coverage/
 *.age
+
+# `health docs --get` writes a downloaded record into the current directory,
+# which may well be this one. These are the types it can produce; none of them
+# is a source file here, and a visit summary must never be committed.
+*.pdf
+*.rtf
+*.html
+*.txt
+*.xml
+*.bin
+
 *.gem
 .DS_Store
 

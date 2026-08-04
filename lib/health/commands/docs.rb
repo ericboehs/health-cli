@@ -108,10 +108,19 @@ module Health
       # Refuses to overwrite. A downloaded record is not something to replace
       # silently, and two visits on one day would otherwise collide on the
       # derived name.
+      #
+      # Opened with EXCL and 0o600 rather than checked-then-written: the check
+      # and the write are one operation that way, and the file is a medical
+      # record, which has no business being world-readable merely because it
+      # landed in a directory whose umask says so. Every other file this tool
+      # writes is 0o600 already.
       def write!(path, body)
-        raise Health::Error, "#{path} already exists — pass --out to choose another name" if File.exist?(path)
-
-        File.binwrite(path, body)
+        File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+          file.binmode
+          file.write(body)
+        end
+      rescue Errno::EEXIST
+        raise Health::Error, "#{path} already exists — pass --out to choose another name"
       end
 
       def consume(arg, argv, opts)

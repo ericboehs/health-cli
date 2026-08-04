@@ -44,6 +44,7 @@ require "health/commands/meds"
 require "health/commands/problems"
 require "health/commands/allergies"
 require "health/commands/shots"
+require "health/commands/docs"
 
 # Every test runs against a throwaway XDG root so nothing touches the real
 # ~/.config/health or, more importantly, a real token store.
@@ -4026,9 +4027,182 @@ class RecordCommandTest < Minitest::Test
   end
 end
 
+# ------------------------------------------------------------- health docs
+
+# Kept apart from RecordCommandTest because this is the one command that
+# writes a file, and every test here needs a directory to write into.
+class DocsCommandTest < Minitest::Test
+  include XDGSandbox
+
+  FakeClient = RecordCommandTest::FakeClient
+
+  def setup
+    super
+    write_config("client_id" => "x")
+    @cwd = Dir.pwd
+    Dir.chdir(@tmp)
+  end
+
+  def teardown
+    Dir.chdir(@cwd)
+    super
+  end
+
+  def document(overrides = {})
+    {
+      "id" => "d1", "status" => "current", "docStatus" => "final",
+      "type" => { "text" => "Office Visit Note" },
+      "category" => [{ "text" => "Clinical Note" }],
+      "author" => [{ "display" => "Ruiz, Elena MD" }],
+      "custodian" => { "display" => "UHS Ambulatory" },
+      "date" => "2026-05-01T12:00:00Z",
+      "content" => [{ "attachment" => { "contentType" => "application/pdf", "title" => "General Exam *",
+                                        "url" => "https://fhir/Binary/XR-1" } }]
+    }.merge(overrides)
+  end
+
+  def run_docs(argv, resources: [document], binary: ["application/pdf", "%PDF-1.4"], quiet: false)
+    @client = FakeClient.new(resources, binary: binary)
+    global = Health::GlobalOptions.new(json: false, quiet: quiet, verbose: false)
+    io, err = StringIO.new, StringIO.new
+    cmd = Health::Commands::Docs.new(global, io: io, err: err, client_factory: ->(_c, _l) { @client })
+    [cmd.run(argv), io.string, err.string]
+  end
+
+  def test_it_lists_documents_with_the_id_that_downloads_them
+    code, out, err = run_docs([])
+
+    assert_equal 0, code
+    assert_match(/General Exam \*\s+Clinical Note\s+Ruiz, Elena MD\s+pdf\s+d1\s+2026-05-01/, out)
+    assert_match(/^1 document\.$/, err)
+  end
+
+  # A content type is nine characters of prefix and three of information, but
+  # one this tool has no short name for is still better shown than dropped.
+  def test_an_unmapped_content_type_is_printed_as_it_arrived
+    _code, out = run_docs([], resources: [document("content" => [
+      { "attachment" => { "contentType" => "application/dicom", "url" => "https://fhir/Binary/XR-9" } }
+    ])])
+
+    assert_includes out, "application/dicom"
+    # No attachment title, so the type text names the row.
+    assert_includes out, "Office Visit Note"
+  end
+
+  # A DocumentReference may carry the same note in several renderings.
+  def test_the_pdf_rendering_is_preferred_over_the_others
+    both = document("content" => [
+      { "attachment" => { "contentType" => "text/html", "url" => "https://fhir/Binary/HTML" } },
+      { "attachment" => { "contentType" => "application/pdf", "url" => "https://fhir/Binary/PDF" } }
+    ])
+    run_docs(["--get", "d1"], resources: [both])
+
+    assert_equal ["https://fhir/Binary/PDF", "application/pdf"], @client.fetched
+  end
+
+  def test_a_document_with_no_author_leaves_the_column_blank
+    _code, out = run_docs([], resources: [document("author" => [])])
+
+    assert_includes out, "General Exam"
+    assert_includes out, Health::Table::BLANK
+  end
+
+  def test_a_document_with_no_usable_attachment_still_lists
+    _code, out = run_docs([], resources: [document("content" => ["junk", { "attachment" => "junk" }])])
+
+    assert_includes out, "Office Visit Note"
+    assert_includes out, Health::Table::BLANK
+  end
+
+  def test_get_writes_the_file_and_says_where
+    code, _out, err = run_docs(["--get", "d1"])
+
+    # realpath because /tmp is a symlink on macOS and the message names the
+    # path the file was actually written to.
+    path = File.join(File.realpath(@tmp), "general-exam-2026-05-01.pdf")
+    assert_equal 0, code
+    assert_equal "%PDF-1.4", File.binread(path)
+    assert_match(/Saved General Exam \* \(8 bytes\) to #{Regexp.escape(path)}/, err)
+  end
+
+  def test_get_honours_out_and_stays_silent_under_quiet
+    target = File.join(@tmp, "nested", "note.pdf")
+    Dir.mkdir(File.dirname(target))
+    code, _out, err = run_docs(["--get", "d1", "--out", target], quiet: true)
+
+    assert_equal 0, code
+    assert_equal "%PDF-1.4", File.binread(target)
+    assert_empty err
+  end
+
+  # Titles come from the record and contain asterisks and slashes; a document
+  # with neither a usable title nor a date has to land somewhere.
+  def test_the_derived_name_survives_a_title_that_is_not_a_filename
+    run_docs(["--get", "d1"], resources: [document(
+      "date" => nil, "content" => [{ "attachment" => { "contentType" => "text/html", "title" => "!!!",
+                                                       "url" => "https://fhir/Binary/X" } }]
+    )], binary: ["text/html", "<html>"])
+
+    assert_path_exists File.join(@tmp, "document-d1.html")
+  end
+
+  def test_an_unknown_content_type_downloads_as_bin
+    run_docs(["--get", "d1"], binary: ["application/dicom", "bytes"])
+
+    assert_path_exists File.join(@tmp, "general-exam-2026-05-01.bin")
+  end
+
+  # Two visits on one day would otherwise collide on the derived name.
+  def test_it_refuses_to_overwrite
+    run_docs(["--get", "d1"])
+    error = assert_raises(Health::Error) { run_docs(["--get", "d1"]) }
+
+    assert_match(/already exists — pass --out/, error.message)
+  end
+
+  # The id the operator has is the one this command printed, so matching
+  # against that list is what makes this a usable message instead of a 404.
+  def test_an_unknown_id_names_the_command_that_lists_them
+    error = assert_raises(Health::Commands::Args::BadArgument) { run_docs(["--get", "nope"]) }
+
+    assert_match(/no document with id "nope" — run `health docs`/, error.message)
+  end
+
+  def test_a_document_with_no_url_says_so_rather_than_downloading_nothing
+    error = assert_raises(Health::Error) do
+      run_docs(["--get", "d1"], resources: [document("content" => [])])
+    end
+
+    assert_match(/no downloadable attachment/, error.message)
+  end
+
+  def test_get_and_out_need_values_and_other_flags_still_reach_the_base
+    assert_raises(Health::Commands::Args::BadArgument) { run_docs(["--get"]) }
+    assert_raises(Health::Commands::Args::BadArgument) { run_docs(["--get", "d1", "--out"]) }
+
+    code, out = run_docs(["--since", "2026-01-01"])
+    assert_equal 0, code
+    assert_includes out, "General Exam"
+
+    error = assert_raises(Health::Commands::Args::BadArgument) { run_docs(["--nope"]) }
+    assert_match(/unknown documents option: --nope/, error.message)
+  end
+
+  # `status` falls back when Millennium omits docStatus.
+  def test_the_status_falls_back_to_the_reference_status
+    global = Health::GlobalOptions.new(json: true, quiet: false, verbose: false)
+    io = StringIO.new
+    client = FakeClient.new([document("docStatus" => nil)])
+    cmd = Health::Commands::Docs.new(global, io: io, err: StringIO.new, client_factory: ->(_c, _l) { client })
+    cmd.run([])
+
+    assert_equal "current", JSON.parse(io.string).first["status"]
+  end
+end
+
 # ---------------------------------------------------------- record dispatch
 
-# The four FHIR commands are one `when` each in CLI#run, and a missing one
+# The five FHIR commands are one `when` each in CLI#run, and a missing one
 # would only show up as "unknown command" for the person who reached for it.
 # Nothing here reaches the network: without a stored grant they stop at the
 # missing patient context.
@@ -4038,7 +4212,7 @@ class RecordDispatchTest < Minitest::Test
   def test_each_record_command_is_reachable
     write_config("client_id" => "x")
 
-    %w[meds problems allergies shots].each do |command|
+    %w[meds problems allergies shots docs].each do |command|
       code, out, err = capture { Health::CLI.run([command]) }
 
       assert_equal 1, code, command
@@ -4052,6 +4226,6 @@ class RecordDispatchTest < Minitest::Test
     code, out = capture { Health::CLI.run(["help"]) }
 
     assert_equal 0, code
-    %w[meds problems allergies shots].each { |command| assert_includes out, command }
+    %w[meds problems allergies shots docs].each { |command| assert_includes out, command }
   end
 end

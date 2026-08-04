@@ -35,5 +35,6 @@ require "health/commands/meds"
 require "health/commands/problems"
 require "health/commands/allergies"
 require "health/commands/shots"
+require "health/commands/docs"
 
 exit(Health::CLI.run(ARGV))

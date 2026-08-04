@@ -37,6 +37,7 @@ module Health
       when "problems"  then Commands::Problems.new(global).run(argv)
       when "allergies" then Commands::Allergies.new(global).run(argv)
       when "shots"     then Commands::Shots.new(global).run(argv)
+      when "docs"      then Commands::Docs.new(global).run(argv)
       else
         warn "unknown command: #{cmd}"
         warn help_text
@@ -94,6 +95,7 @@ module Health
           problems       The problem list
           allergies      Allergies and intolerances
           shots          Immunizations
+          docs           Clinical notes and visit summaries
 
         Other:
           config init    Write a starter config
@@ -119,11 +121,15 @@ module Health
           --no-vitals    Only labs
           --history NAME Every recorded draw of one analyte, newest first
 
-        Record flags (meds, problems, allergies, shots):
+        Record flags (meds, problems, allergies, shots, docs):
           --since DATE   Only entries on or after DATE (YYYY-MM-DD)
           --until DATE   Only entries on or before DATE (YYYY-MM-DD)
           --all          meds: include stopped and completed prescriptions
                          problems: include encounter diagnoses, not just the problem list
+
+        Docs flags:
+          --get ID       Download one document (ids come from `health docs`)
+          --out PATH     Where to write it; defaults to a name derived in the current directory
       HELP
     end
   end

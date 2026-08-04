@@ -33,6 +33,10 @@ module Health
       when "auth"   then Commands::Auth.new(global).run(argv)
       when "config" then Commands::Config.new(global).run(argv)
       when "labs"   then Commands::Labs.new(global).run(argv)
+      when "meds"      then Commands::Meds.new(global).run(argv)
+      when "problems"  then Commands::Problems.new(global).run(argv)
+      when "allergies" then Commands::Allergies.new(global).run(argv)
+      when "shots"     then Commands::Shots.new(global).run(argv)
       else
         warn "unknown command: #{cmd}"
         warn help_text
@@ -86,6 +90,10 @@ module Health
 
         Record:
           labs           Latest value per analyte, with reference ranges
+          meds           Prescriptions, active ones by default
+          problems       The problem list
+          allergies      Allergies and intolerances
+          shots          Immunizations
 
         Other:
           config init    Write a starter config
@@ -110,6 +118,12 @@ module Health
           --vitals       Only vitals (BP, pulse, weight, BMI)
           --no-vitals    Only labs
           --history NAME Every recorded draw of one analyte, newest first
+
+        Record flags (meds, problems, allergies, shots):
+          --since DATE   Only entries on or after DATE (YYYY-MM-DD)
+          --until DATE   Only entries on or before DATE (YYYY-MM-DD)
+          --all          meds: include stopped and completed prescriptions
+                         problems: include encounter diagnoses, not just the problem list
       HELP
     end
   end

@@ -38,6 +38,12 @@ require "health/portal/history_index"
 require "health/commands/labs"
 require "health/fhir"
 require "health/fhir/client"
+require "health/table"
+require "health/commands/resource"
+require "health/commands/meds"
+require "health/commands/problems"
+require "health/commands/allergies"
+require "health/commands/shots"
 
 # Every test runs against a throwaway XDG root so nothing touches the real
 # ~/.config/health or, more importantly, a real token store.
@@ -3578,3 +3584,474 @@ class FHIRClientTest < Minitest::Test
   end
 end
 
+# ------------------------------------------------------------------- the table
+
+class TableTest < Minitest::Test
+  def test_columns_are_measured_not_fixed
+    table = Health::Table.new(["Drug"], ["Dose"])
+    lines = table.render([["a", "1"], ["a much longer drug name", "2"]])
+
+    assert_equal "Drug                     Dose", lines[0]
+    assert_equal "-----------------------  ----", lines[1]
+    assert_equal "a much longer drug name  2", lines.last
+  end
+
+  def test_a_right_aligned_column_is_right_aligned
+    table = Health::Table.new(["Refills", { align: :right }])
+    assert_equal "      3", table.render([["3"]]).last
+  end
+
+  # An empty cell under "Refills" would read as none left; the record merely
+  # never said.
+  def test_an_absent_cell_is_marked_rather_than_left_blank
+    table = Health::Table.new(["A"], ["B"])
+    assert_equal "a  —", table.render([["a", nil]], header: false).first
+    assert_equal "a  —", table.render([["a", "   "]], header: false).first
+  end
+
+  def test_a_cell_past_its_column_maximum_is_truncated
+    table = Health::Table.new(["Sig", { max: 6 }])
+    assert_equal ["12345…"], table.render([["1234567890"]], header: false)
+    # Exactly at the maximum is not truncated.
+    assert_equal ["123456"], table.render([["123456"]], header: false)
+  end
+
+  def test_the_header_can_be_suppressed
+    lines = Health::Table.new(["A"]).render([["x"]], header: false)
+    assert_equal ["x"], lines
+  end
+
+  # So a copied line doesn't carry the padding of the widest row after it.
+  def test_trailing_padding_is_stripped
+    lines = Health::Table.new(["A"], ["B"]).render([["x", "yy"], ["xxxx", "z"]], header: false)
+    assert_equal "x     yy", lines[0]
+    assert_equal "xxxx  z", lines[1]
+  end
+
+  def test_no_rows_and_no_header_renders_nothing
+    assert_empty Health::Table.new(["A"]).render([], header: false)
+  end
+end
+
+# ------------------------------------------------- the shared record commands
+
+# `meds`, `problems`, `allergies`, `shots` and `docs` all run through
+# Commands::Resource, so the base class behaviour is exercised once here (on
+# Meds, arbitrarily) and each command's own tests cover only what it adds.
+class RecordCommandTest < Minitest::Test
+  include XDGSandbox
+
+  # Stands in for a FHIR::Client without reaching the network.
+  class FakeClient
+    attr_reader :searched, :fetched
+
+    def initialize(resources, binary: ["application/pdf", "%PDF-1.4"])
+      @resources = resources
+      @binary = binary
+      @searched = []
+    end
+
+    def search(type, params = {})
+      @searched << [type, params]
+      @resources
+    end
+
+    def fetch_binary(url, accept: nil)
+      @fetched = [url, accept]
+      raise Health::FHIR::Error, @binary if @binary.is_a?(String)
+
+      @binary
+    end
+  end
+
+  def setup
+    super
+    write_config("client_id" => "x")
+  end
+
+  def run_cmd(klass, argv, resources: [], client: nil, json: false, quiet: false, verbose: false)
+    @client = client || FakeClient.new(resources)
+    global = Health::GlobalOptions.new(json: json, quiet: quiet, verbose: verbose)
+    io, err = StringIO.new, StringIO.new
+    cmd = klass.new(global, io: io, err: err,
+      client_factory: ->(_config, log) { @log = log; @client })
+    [cmd.run(argv), io.string, err.string]
+  end
+
+  def med(overrides = {})
+    {
+      "id" => "m1", "status" => "active", "authoredOn" => "2026-05-01T12:00:00Z",
+      "medicationCodeableConcept" => { "text" => "lisinopril 10 mg tablet" },
+      "dosageInstruction" => [{ "patientInstruction" => "1 tablet daily" }],
+      "dispenseRequest" => { "numberOfRepeatsAllowed" => 3,
+                             "quantity" => { "value" => 30.0, "unit" => "tab" } }
+    }.merge(overrides)
+  end
+
+  # ------------------------------------------------------- the base class
+
+  # The three hooks a subclass must supply say so rather than misbehaving.
+  def test_the_base_class_is_abstract
+    base = Health::Commands::Resource.new(Health::GlobalOptions.new(json: false, quiet: false, verbose: false))
+
+    %i[resource_type columns noun].each do |hook|
+      assert_raises(NotImplementedError) { base.public_send(hook) }
+    end
+    assert_raises(NotImplementedError) { base.extract({}) }
+  end
+
+  # Without a factory the command builds a real client; nothing here talks to
+  # the network, but the wiring is what would break silently.
+  def test_the_default_client_is_a_fhir_client
+    cmd = Health::Commands::Meds.new(Health::GlobalOptions.new(json: false, quiet: false, verbose: false))
+    factory = cmd.instance_variable_get(:@client_factory)
+
+    assert_instance_of Health::FHIR::Client, factory.call(config, nil)
+  end
+
+  # Progress is stderr under --verbose and nowhere under --quiet, so a piped
+  # --json stays clean either way.
+  def test_verbose_logs_go_to_stderr_and_quiet_wins
+    run_cmd(Health::Commands::Meds, [], resources: [med], verbose: true)
+    refute_nil @log
+
+    run_cmd(Health::Commands::Meds, [], resources: [med], verbose: true, quiet: true)
+    assert_nil @log
+
+    run_cmd(Health::Commands::Meds, [], resources: [med])
+    assert_nil @log
+  end
+
+  def test_a_date_window_filters_and_keeps_undated_rows
+    resources = [
+      med("id" => "old", "authoredOn" => "2020-01-01T00:00:00Z"),
+      med("id" => "new", "authoredOn" => "2026-05-01T00:00:00Z"),
+      med("id" => "undated", "authoredOn" => nil)
+    ]
+
+    _code, out = run_cmd(Health::Commands::Meds, ["--since", "2026-01-01"], resources: resources, json: true)
+    assert_equal %w[new undated], JSON.parse(out).map { |r| r["id"] }.sort
+
+    _code, out = run_cmd(Health::Commands::Meds, ["--until", "2021-01-01"], resources: resources, json: true)
+    assert_equal %w[old undated], JSON.parse(out).map { |r| r["id"] }.sort
+  end
+
+  def test_rows_are_sorted_newest_first
+    resources = [med("id" => "a", "authoredOn" => "2020-01-01"), med("id" => "b", "authoredOn" => "2026-01-01")]
+    _code, out = run_cmd(Health::Commands::Meds, [], resources: resources, json: true)
+
+    assert_equal %w[b a], JSON.parse(out).map { |r| r["id"] }
+  end
+
+  def test_an_empty_result_says_so_on_stderr_and_stays_quiet_under_quiet
+    code, out, err = run_cmd(Health::Commands::Meds, [])
+    assert_equal 0, code
+    assert_empty out
+    assert_match(/no medications matched/, err)
+
+    _code, _out, err = run_cmd(Health::Commands::Meds, [], quiet: true)
+    assert_empty err
+  end
+
+  def test_the_count_is_singularised
+    _code, _out, err = run_cmd(Health::Commands::Meds, [], resources: [med])
+    assert_match(/^1 medication\.$/, err)
+
+    _code, _out, err = run_cmd(Health::Commands::Meds, [], resources: [med, med("id" => "m2")])
+    assert_match(/^2 medications\.$/, err)
+
+    _code, _out, err = run_cmd(Health::Commands::Meds, [], resources: [med], quiet: true)
+    assert_empty err
+  end
+
+  def test_bad_flags_are_rejected
+    error = assert_raises(Health::Commands::Args::BadArgument) { run_cmd(Health::Commands::Meds, ["--nope"]) }
+    assert_match(/unknown medications option: --nope/, error.message)
+
+    assert_raises(Health::Commands::Args::BadArgument) { run_cmd(Health::Commands::Meds, ["--since"]) }
+    error = assert_raises(Health::Commands::Args::BadArgument) do
+      run_cmd(Health::Commands::Meds, ["--since", "May"])
+    end
+    assert_match(/YYYY-MM-DD/, error.message)
+  end
+
+  # ------------------------------------------------------------------ meds
+
+  def test_meds_shows_active_prescriptions_and_counts_what_it_hid
+    resources = [med, med("id" => "m2", "status" => "completed"), med("id" => "m3", "status" => "on-hold")]
+    _code, out, err = run_cmd(Health::Commands::Meds, [], resources: resources)
+
+    assert_match(/lisinopril 10 mg tablet\s+1 tablet daily\s+3\s+2026-05-01/, out)
+    refute_includes out, "Status"
+    assert_match(/1 more on record \(completed, stopped or expired\)/, err)
+  end
+
+  # The difference between "3 refills authorized" and "3 refills left" is the
+  # kind of thing someone plans a week around.
+  def test_meds_says_refills_are_authorized_not_remaining
+    _code, _out, err = run_cmd(Health::Commands::Meds, [], resources: [med])
+    assert_match(/what the prescription authorized, not what remains/, err)
+
+    _code, _out, err = run_cmd(Health::Commands::Meds, [],
+      resources: [med("dispenseRequest" => {})])
+    refute_match(/authorized/, err)
+  end
+
+  def test_meds_all_shows_status_and_hides_nothing
+    resources = [med, med("id" => "m2", "status" => "completed")]
+    _code, out, err = run_cmd(Health::Commands::Meds, ["--all"], resources: resources)
+
+    assert_includes out, "Status"
+    assert_includes out, "completed"
+    refute_match(/more on record/, err)
+  end
+
+  def test_meds_carries_the_rest_of_the_prescription_into_json
+    resources = [med("requester" => { "display" => "Dr Ruiz" },
+                     "dispenseRequest" => { "performer" => { "display" => "Corner Pharmacy" },
+                                            "quantity" => { "value" => 30.0, "unit" => "tab" } })]
+    _code, out = run_cmd(Health::Commands::Meds, [], resources: resources, json: true)
+    row = JSON.parse(out).first
+
+    assert_equal "Dr Ruiz", row["prescriber"]
+    assert_equal "Corner Pharmacy", row["pharmacy"]
+    # 30 tab, not 30.0 tab.
+    assert_equal "30 tab", row["quantity"]
+  end
+
+  def test_meds_quantities_that_are_not_whole_keep_their_decimal
+    cases = {
+      { "value" => 8.5, "unit" => "g" } => "8.5 g",
+      { "value" => 12 } => "12",
+      { "value" => nil, "unit" => "tab" } => nil,
+      "junk" => nil
+    }
+    cases.each do |quantity, expected|
+      _code, out = run_cmd(Health::Commands::Meds, [],
+        resources: [med("dispenseRequest" => { "quantity" => quantity })], json: true)
+      actual = JSON.parse(out).first["quantity"]
+      expected.nil? ? assert_nil(actual, quantity.inspect) : assert_equal(expected, actual, quantity.inspect)
+    end
+  end
+
+  def test_meds_falls_back_to_the_sig_text_when_there_is_no_patient_instruction
+    _code, out = run_cmd(Health::Commands::Meds, [],
+      resources: [med("dosageInstruction" => [{ "text" => "TAKE 1 TABLET BY MOUTH DAILY" }])], json: true)
+    assert_equal "TAKE 1 TABLET BY MOUTH DAILY", JSON.parse(out).first["sig"]
+
+    _code, out = run_cmd(Health::Commands::Meds, [],
+      resources: [med("dosageInstruction" => ["junk"])], json: true)
+    assert_nil JSON.parse(out).first["sig"]
+  end
+
+  # -------------------------------------------------------------- problems
+
+  def condition(overrides = {})
+    {
+      "id" => "c1",
+      "code" => { "text" => "Hypertension" },
+      "clinicalStatus" => { "coding" => [{ "code" => "active" }] },
+      "category" => [{ "coding" => [{ "code" => "problem-list-item" }] }],
+      "onsetDateTime" => "2019-04-02T00:00:00Z"
+    }.merge(overrides)
+  end
+
+  def encounter_diagnosis(overrides = {})
+    condition({ "id" => "e1",
+                "category" => [{ "coding" => [{ "code" => "encounter-diagnosis" }] }] }.merge(overrides))
+  end
+
+  # 30 problems against 106 encounter diagnoses on the real record: printing
+  # all of them as "your problems" would be wrong in the alarming direction.
+  def test_problems_shows_the_problem_list_and_counts_the_diagnoses
+    _code, out, err = run_cmd(Health::Commands::Problems, [],
+      resources: [condition, encounter_diagnosis])
+
+    assert_match(/Hypertension\s+active\s+2019-04-02/, out)
+    refute_includes out, "Category"
+    assert_match(/1 encounter diagnosis not on the problem list/, err)
+
+    _code, _out, err = run_cmd(Health::Commands::Problems, [],
+      resources: [condition, encounter_diagnosis, encounter_diagnosis("id" => "e2")])
+    assert_match(/2 encounter diagnoses not on the problem list/, err)
+  end
+
+  def test_problems_rejects_a_flag_it_does_not_know
+    error = assert_raises(Health::Commands::Args::BadArgument) { run_cmd(Health::Commands::Problems, ["--nope"]) }
+    assert_match(/unknown problems option: --nope/, error.message)
+  end
+
+  def test_problems_all_adds_the_category_column
+    _code, out, err = run_cmd(Health::Commands::Problems, ["--all"],
+      resources: [condition, encounter_diagnosis])
+
+    assert_includes out, "Category"
+    assert_includes out, "encounter-diagnosis"
+    refute_match(/not on the problem list/, err)
+  end
+
+  # Millennium tags each Condition with a US Core category *and* a SNOMED one,
+  # so the category is looked up by the code rather than by position.
+  def test_problems_finds_the_category_it_knows_whatever_order_it_arrives_in
+    snomed_first = condition("category" => [
+      { "coding" => [{ "code" => "55607006", "display" => "Medical (qualifier value)" }] },
+      { "coding" => [{ "code" => "problem-list-item" }] }
+    ])
+    _code, out = run_cmd(Health::Commands::Problems, [], resources: [snomed_first])
+    assert_includes out, "Hypertension"
+
+    unknown = condition("category" => ["junk", { "coding" => [{ "code" => "health-concern" }] }])
+    _code, out = run_cmd(Health::Commands::Problems, ["--all"], resources: [unknown])
+    assert_includes out, "health-concern"
+
+    _code, out = run_cmd(Health::Commands::Problems, ["--all"], resources: [condition("category" => nil)], json: true)
+    assert_nil JSON.parse(out).first["category"]
+  end
+
+  # A row with no date at all reads as missing data when the date is merely in
+  # the other field.
+  def test_problems_falls_back_from_onset_to_recorded
+    _code, out = run_cmd(Health::Commands::Problems, [],
+      resources: [condition("onsetDateTime" => nil, "recordedDate" => "2021-08-09T00:00:00Z")], json: true)
+    row = JSON.parse(out).first
+
+    assert_equal "2021-08-09", row["date"]
+    assert_equal "2021-08-09", row["recorded"]
+  end
+
+  # ------------------------------------------------------------- allergies
+
+  def allergy(overrides = {})
+    {
+      "id" => "a1",
+      "code" => { "text" => "Penicillins" },
+      "criticality" => "high",
+      "category" => ["medication"],
+      "clinicalStatus" => { "coding" => [{ "code" => "active" }] },
+      "verificationStatus" => { "coding" => [{ "code" => "confirmed" }] },
+      "recordedDate" => "2015-03-04T00:00:00Z",
+      "reaction" => [{ "manifestation" => [{ "text" => "Hives" }, { "text" => "Hives" }] },
+                     { "manifestation" => [{ "text" => "Swelling" }] }]
+    }.merge(overrides)
+  end
+
+  # An allergy list is the one list where an omission is dangerous rather than
+  # merely untidy, so a resolved entry still gets a row.
+  def test_allergies_are_never_filtered_by_status
+    resolved = allergy("id" => "a2", "code" => { "text" => "Sulfa" },
+                       "clinicalStatus" => { "coding" => [{ "code" => "resolved" }] })
+    _code, out, err = run_cmd(Health::Commands::Allergies, [], resources: [allergy, resolved])
+
+    assert_includes out, "Penicillins"
+    assert_includes out, "Sulfa"
+    assert_includes out, "resolved"
+    assert_match(/^2 allergies\.$/, err)
+  end
+
+  # Allergies take the base class summary, which --quiet silences too.
+  def test_quiet_silences_the_count_on_every_command
+    _code, out, err = run_cmd(Health::Commands::Allergies, [], resources: [allergy], quiet: true)
+    refute_empty out
+    assert_empty err
+
+    _code, _out, err = run_cmd(Health::Commands::Problems, [], resources: [condition, encounter_diagnosis],
+      quiet: true)
+    assert_empty err
+  end
+
+  def test_allergies_join_their_reactions_without_repeating_one
+    _code, out = run_cmd(Health::Commands::Allergies, [], resources: [allergy], json: true)
+    row = JSON.parse(out).first
+
+    assert_equal "Hives, Swelling", row["reaction"]
+    assert_equal "medication", row["category"]
+    assert_equal "confirmed", row["verification"]
+  end
+
+  def test_allergies_without_a_reaction_leave_the_column_blank
+    _code, out = run_cmd(Health::Commands::Allergies, [],
+      resources: [allergy("reaction" => ["junk", { "manifestation" => [] }])], json: true)
+    assert_nil JSON.parse(out).first["reaction"]
+
+    _code, out = run_cmd(Health::Commands::Allergies, [], resources: [allergy("reaction" => nil)])
+    assert_includes out, Health::Table::BLANK
+  end
+
+  # ----------------------------------------------------------------- shots
+
+  def shot(overrides = {})
+    {
+      "id" => "i1", "status" => "completed",
+      "vaccineCode" => { "text" => "influenza virus vaccine, inactivated",
+                         "coding" => [{ "system" => Health::Commands::Shots::CVX, "code" => "150",
+                                        "display" => "Fluzone Quadrivalent 2021-2022" }] },
+      "site" => { "text" => "Left Deltoid" },
+      "occurrenceDateTime" => "2021-10-14T00:00:00Z"
+    }.merge(overrides)
+  end
+
+  def test_shots_show_the_cvx_product_alongside_what_was_selected
+    _code, out = run_cmd(Health::Commands::Shots, [], resources: [shot])
+
+    assert_match(/influenza virus vaccine, inactivated\s+Fluzone Quadrivalent/, out)
+    assert_includes out, "Left Deltoid"
+  end
+
+  # The column earns its width or stays empty.
+  def test_shots_suppress_a_product_that_repeats_the_vaccine_name
+    same = shot("vaccineCode" => { "text" => "Tdap",
+                                   "coding" => [{ "system" => Health::Commands::Shots::CVX, "display" => "Tdap" }] })
+    _code, out = run_cmd(Health::Commands::Shots, [], resources: [same], json: true)
+    assert_nil JSON.parse(out).first["product"]
+
+    no_cvx = shot("vaccineCode" => { "text" => "Tdap", "coding" => [{ "system" => "urn:oid:2.16", "display" => "x" }] })
+    _code, out = run_cmd(Health::Commands::Shots, [], resources: [no_cvx], json: true)
+    assert_nil JSON.parse(out).first["product"]
+
+    _code, out = run_cmd(Health::Commands::Shots, [], resources: [shot("vaccineCode" => nil)], json: true)
+    assert_nil JSON.parse(out).first["product"]
+  end
+
+  def test_shots_take_a_date_that_arrived_as_a_string
+    _code, out = run_cmd(Health::Commands::Shots, [],
+      resources: [shot("occurrenceDateTime" => nil, "occurrenceString" => "2009-11-02",
+                       "location" => { "display" => "Clinic" },
+                       "manufacturer" => { "display" => "Sanofi" }, "lotNumber" => "UT123")], json: true)
+    row = JSON.parse(out).first
+
+    assert_equal "2009-11-02", row["date"]
+    assert_equal "Clinic", row["location"]
+    assert_equal "Sanofi", row["manufacturer"]
+    assert_equal "UT123", row["lot"]
+  end
+end
+
+# ---------------------------------------------------------- record dispatch
+
+# The four FHIR commands are one `when` each in CLI#run, and a missing one
+# would only show up as "unknown command" for the person who reached for it.
+# Nothing here reaches the network: without a stored grant they stop at the
+# missing patient context.
+class RecordDispatchTest < Minitest::Test
+  include XDGSandbox
+
+  def test_each_record_command_is_reachable
+    write_config("client_id" => "x")
+
+    %w[meds problems allergies shots].each do |command|
+      code, out, err = capture { Health::CLI.run([command]) }
+
+      assert_equal 1, code, command
+      assert_empty out
+      assert_match(/health auth login/, err, command)
+      refute_match(/unknown command/, err, command)
+    end
+  end
+
+  def test_the_help_lists_them
+    code, out = capture { Health::CLI.run(["help"]) }
+
+    assert_equal 0, code
+    %w[meds problems allergies shots].each { |command| assert_includes out, command }
+  end
+end

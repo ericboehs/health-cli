@@ -138,7 +138,9 @@ nothing but JSON.
 
 ### What the record commands decide for you
 
-Three of these have a default that hides rows, and each says how many:
+Two of these hide rows by default, and both say how many — on every path,
+including when the filter empties the list. The third deliberately hides
+nothing:
 
 - **`meds`** shows active, on-hold and draft prescriptions, and prints the
   count of what it left out. Its Refills column is what the prescriber

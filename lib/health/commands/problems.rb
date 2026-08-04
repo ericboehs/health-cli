@@ -27,7 +27,7 @@ module Health
       def extract(resource)
         {
           problem: FHIR.display(resource["code"]),
-          status: FHIR.status_code(resource["clinicalStatus"]),
+          status: qualified_status(resource),
           verification: FHIR.status_code(resource["verificationStatus"]),
           category: category_of(resource),
           # Onset is what a person means by "since when"; recordedDate is when
@@ -61,10 +61,7 @@ module Health
         kept
       end
 
-      def summarize(items)
-        return if @global.quiet
-
-        super
+      def hidden_note
         return if @hidden.to_i.zero?
 
         @err.puts "#{@hidden} encounter #{(@hidden == 1) ? "diagnosis" : "diagnoses"} not on the " \

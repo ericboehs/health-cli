@@ -11,6 +11,7 @@ module Health
     class Allergies < Resource
       def resource_type = "AllergyIntolerance"
       def noun = "allergies"
+      def singular = "allergy"
 
       def columns
         [
@@ -30,7 +31,7 @@ module Health
           type: FHIR.presence(resource["type"]),
           # `category` is a plain array of strings here, not CodeableConcepts.
           category: Array(resource["category"]).map(&:to_s).join(", "),
-          status: FHIR.status_code(resource["clinicalStatus"]),
+          status: qualified_status(resource),
           verification: FHIR.status_code(resource["verificationStatus"]),
           date: FHIR.date_from(resource, "recordedDate", "onsetDateTime"),
           id: resource["id"]

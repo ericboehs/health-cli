@@ -37,9 +37,7 @@ module Health
 
       def run(argv)
         opts = parse!(argv.dup)
-        return download(opts) if opts[:get]
-
-        super
+        opts[:get] ? download(opts) : execute(opts)
       end
 
       def extract(resource)

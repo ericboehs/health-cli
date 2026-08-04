@@ -28,8 +28,13 @@ module Health
       # appear in `columns` are printed; the rest are carried into --json.
       def extract(_resource) = raise(NotImplementedError)
 
-      # What to call these in a message. Plural; `summarize` singularizes.
+      # What to call these in a message. Plural.
       def noun = raise(NotImplementedError)
+
+      # Overridden where dropping the "s" is not the singular — "1 allergie."
+      # is the kind of thing a reader stops on, in output whose whole job is to
+      # be read carefully.
+      def singular = noun.sub(/s\z/, "")
 
       # Newest first, which is right for every one of these: a medication list,
       # a problem list and a document list are all read from the top.
@@ -43,8 +48,13 @@ module Health
           ->(config, log) { FHIR::Client.new(config, io: log) }
       end
 
-      def run(argv)
-        opts = parse!(argv.dup)
+      def run(argv) = execute(parse!(argv.dup))
+
+      private
+
+      # Split from `run` so a subclass that takes over the argv (`docs --get`)
+      # parses once and hands the same options back here.
+      def execute(opts)
         items = collect(opts)
 
         return emit_json(items) if @global.json
@@ -52,8 +62,6 @@ module Health
         print_table(items)
         0
       end
-
-      private
 
       attr_reader :opts
 
@@ -84,12 +92,23 @@ module Health
 
       def emit_json(items)
         @io.puts JSON.pretty_generate(items)
+        # The document stays the array it has always been — the count of what
+        # was withheld goes to stderr, where every other count in this tool
+        # goes, so `--json | jq` is unaffected and the operator still hears it.
+        hidden_note unless @global.quiet
         0
       end
 
       def print_table(items)
         if items.empty?
-          @err.puts "health: no #{noun} matched." unless @global.quiet
+          unless @global.quiet
+            @err.puts "health: no #{noun} matched."
+            # Said here too, and not only alongside a count. A record whose
+            # every prescription is completed otherwise answers "no medications
+            # matched", which reads as "you are on no medications" — in exactly
+            # the case where the hint about `--all` is the whole answer.
+            hidden_note
+          end
           return
         end
 
@@ -103,7 +122,29 @@ module Health
       def summarize(items)
         return if @global.quiet
 
-        @err.puts "#{items.size} #{(items.size == 1) ? noun.sub(/s\z/, "") : noun}."
+        @err.puts "#{items.size} #{(items.size == 1) ? singular : noun}."
+        notes(items)
+        hidden_note
+      end
+
+      # What a command wants to say about the rows it printed.
+      def notes(_items) = nil
+
+      # What a command wants to say about the rows it didn't. Overridden by
+      # every command that filters by default, and said on all three paths —
+      # table, empty table, and JSON.
+      def hidden_note = nil
+
+      # Millennium records clinicalStatus and verificationStatus separately,
+      # and reading only the first prints a refuted allergy as an ordinary
+      # one. Anything but "confirmed" is worth a reader's attention, so it
+      # rides along in the same cell rather than paying for a column.
+      def qualified_status(resource)
+        clinical = FHIR.status_code(resource["clinicalStatus"])
+        verification = FHIR.status_code(resource["verificationStatus"])
+        return clinical if verification.nil? || verification == "confirmed"
+
+        [clinical, "(#{verification})"].compact.join(" ")
       end
 
       # Subclasses that take their own flags override this and call `super` for

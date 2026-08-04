@@ -3833,7 +3833,31 @@ class RecordCommandTest < Minitest::Test
 
     assert_match(/lisinopril 10 mg tablet\s+1 tablet daily\s+3\s+2026-05-01/, out)
     refute_includes out, "Status"
-    assert_match(/1 more on record \(completed, stopped or expired\)/, err)
+    assert_match(/1 more on record \(completed, stopped, cancelled or otherwise inactive\)/, err)
+  end
+
+  # The document stays the array it has always been, so `--json | jq` is
+  # unaffected — but a count of what was withheld is not something to drop
+  # merely because the caller asked for JSON.
+  def test_the_hidden_count_reaches_stderr_on_the_json_path_too
+    resources = [med, med("id" => "m2", "status" => "completed")]
+    _code, out, err = run_cmd(Health::Commands::Meds, [], resources: resources, json: true)
+
+    assert_equal ["m1"], JSON.parse(out).map { |r| r["id"] }
+    assert_match(/1 more on record/, err)
+
+    _code, _out, err = run_cmd(Health::Commands::Meds, [], resources: resources, json: true, quiet: true)
+    assert_empty err
+  end
+
+  # "no medications matched" alone would read as an empty record when the
+  # filter is what emptied it.
+  def test_the_hidden_count_is_said_even_when_the_filter_left_nothing
+    _code, out, err = run_cmd(Health::Commands::Meds, [], resources: [med("status" => "completed")])
+
+    assert_empty out
+    assert_match(/no medications matched/, err)
+    assert_match(/1 more on record/, err)
   end
 
   # The difference between "3 refills authorized" and "3 refills left" is the
@@ -3996,6 +4020,35 @@ class RecordCommandTest < Minitest::Test
     assert_includes out, "Sulfa"
     assert_includes out, "resolved"
     assert_match(/^2 allergies\.$/, err)
+  end
+
+  # "1 allergies." is the kind of thing that makes a tool look unread.
+  def test_one_allergy_is_an_allergy
+    _code, _out, err = run_cmd(Health::Commands::Allergies, [], resources: [allergy])
+    assert_match(/^1 allergy\.$/, err)
+  end
+
+  # Millennium records clinicalStatus and verificationStatus separately, and
+  # reading only the first prints a refuted allergy as an ordinary active one
+  # — on the one list where a wrong row is dangerous rather than untidy.
+  def test_an_unconfirmed_verification_rides_along_with_the_clinical_status
+    refuted = allergy("verificationStatus" => { "coding" => [{ "code" => "refuted" }] })
+    _code, out = run_cmd(Health::Commands::Allergies, [], resources: [refuted])
+    assert_match(/active \(refuted\)/, out)
+
+    entered_in_error = condition("verificationStatus" => { "coding" => [{ "code" => "entered-in-error" }] })
+    _code, out = run_cmd(Health::Commands::Problems, [], resources: [entered_in_error])
+    assert_match(/active \(entered-in-error\)/, out)
+
+    # Confirmed is the ordinary case and says nothing extra; so is a record
+    # that never stated a verification at all.
+    _code, out = run_cmd(Health::Commands::Allergies, [], resources: [allergy])
+    assert_match(/active\s+2015-03-04/, out)
+    refute_match(/active \(/, out)
+
+    _code, out = run_cmd(Health::Commands::Allergies, [], resources: [allergy("verificationStatus" => nil)])
+    assert_match(/active\s+2015-03-04/, out)
+    refute_match(/active \(/, out)
   end
 
   # Allergies take the base class summary, which --quiet silences too.
